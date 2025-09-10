@@ -252,9 +252,9 @@ bool InlineGlobalSlotsAnalysis::isValueSafeTransferFunction(Value value) {
 
 SmallVector<Operation *> getBackwardSliceIncludingRoot(Value initialValue) {
   SetVector<Operation *> sliceSet;
-  [[maybe_unused]] LogicalResult ret =
+  [[maybe_unused]] LogicalResult result =
       getBackwardSlice(initialValue, &sliceSet);
-  assert(ret.succeeded());
+  assert(result.succeeded() && "expected a backward slice");
   SmallVector<Operation *> slice;
   llvm::append_range(slice, sliceSet);
   slice.push_back(initialValue.getDefiningOp());

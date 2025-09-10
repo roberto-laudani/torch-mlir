@@ -421,6 +421,7 @@ static void markDecomposedOpsAsIllegal(MLIRContext *context,
   target.addIllegalOp<Aten_LinalgDetOp>();
   target.addIllegalOp<AtenLinalgSlogdetOp>();
   target.addIllegalOp<AtenPixelShuffleOp>();
+  target.addIllegalOp<AtenChannelShuffleOp>();
   target.addIllegalOp<AtenTOp>();
   target.addIllegalOp<Aten_LogSoftmaxBackwardDataOp>();
   target.addDynamicallyLegalOp<AtenMatmulOp>([](AtenMatmulOp op) {
@@ -437,6 +438,7 @@ static void markDecomposedOpsAsIllegal(MLIRContext *context,
   target.addIllegalOp<AtenInstanceNormOp>();
   target.addIllegalOp<AtenLayerNormOp>();
   target.addIllegalOp<AtenNativeLayerNormOp>();
+  target.addIllegalOp<AtenRmsNormOp>();
   target.addIllegalOp<AtenGroupNormOp>();
   target.addIllegalOp<AtenNativeGroupNormOp>();
   target.addIllegalOp<AtenNativeBatchNormOp>();
@@ -460,6 +462,7 @@ static void markDecomposedOpsAsIllegal(MLIRContext *context,
   target.addIllegalOp<AtenSquareOp>();
   target.addIllegalOp<AtenVarOp>();
   target.addIllegalOp<AtenStdOp>();
+  target.addIllegalOp<AtenHeavisideOp>();
   target.addIllegalOp<Aten_UnsafeViewOp>();
   target.addIllegalOp<Aten_ReshapeAliasOp>();
   target.addIllegalOp<AtenBernoulliOp>();
@@ -537,6 +540,7 @@ static void markDecomposedOpsAsIllegal(MLIRContext *context,
   target.addIllegalOp<AtenLerpTensorOp>();
   target.addIllegalOp<AtenMseLossOp>();
   target.addIllegalOp<AtenL1LossOp>();
+  target.addIllegalOp<AtenPoissonNllLossOp>();
   target.addIllegalOp<AtenRandintLowOp>();
   target.addIllegalOp<AtenRandintOp>();
   target.addIllegalOp<AtenVarMeanCorrectionOp>();
@@ -585,6 +589,8 @@ static void markDecomposedOpsAsIllegal(MLIRContext *context,
   target.addIllegalOp<AtenFlipudOp>();
   target.addIllegalOp<AtenLogaddexpOp>();
   target.addIllegalOp<AtenLogaddexp2Op>();
+  target.addIllegalOp<AtenKlDivOp>();
+  target.addIllegalOp<AtenAsStridedOp>();
 
   for (auto &opName : backendLegalOpsSet) {
     target.addLegalOp(

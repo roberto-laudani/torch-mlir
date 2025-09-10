@@ -60,6 +60,13 @@ def TMTensor_ScanOp : TMTensor_Op<"scan",
                        BoolAttr:$inclusive
   );
 
+  let builders = [
+    OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs,
+      CArg<"int64_t", "0">:$dimension, CArg<"bool", "true">:$inclusive), [{
+        build($_builder, $_state, TypeRange(outputs), inputs, outputs, dimension, inclusive);
+      }]>
+  ];
+
   let results = (outs Variadic<AnyRankedTensor>:$results);
   let regions = (region AnyRegion:$region);
   let hasFolder = 1;
@@ -260,6 +267,12 @@ def TMTensor_AttentionOp : TMTensor_Op<"attention",
   let arguments = (ins Variadic<AnyShaped>:$inputs,
                        Variadic<AnyShaped>:$outputs
   );
+
+  let builders = [
+    OpBuilder<(ins "ValueRange":$inputs, "ValueRange":$outputs), [{
+        build($_builder, $_state, TypeRange(outputs), inputs, outputs);
+    }]>
+  ];
 
   let results = (outs Variadic<AnyRankedTensor>:$result);
   let assemblyFormat = [{
