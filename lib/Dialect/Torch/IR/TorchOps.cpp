@@ -2839,6 +2839,28 @@ OpFoldResult AtenAnyBoolOp::fold(FoldAdaptor adaptor) {
 }
 
 //===----------------------------------------------------------------------===//
+// AtenAllBoolOp
+//===----------------------------------------------------------------------===//
+
+OpFoldResult AtenAllBoolOp::fold(FoldAdaptor adaptor) {
+  auto inputConstruct = getSelf().getDefiningOp<Torch::PrimListConstructOp>();
+  if (!inputConstruct || isListPotentiallyMutated(inputConstruct))
+    return nullptr;
+  // If all operands are a constant true, return true.
+  // If any operands are a constant false, return false
+  bool allConstants = true;
+  for (auto operand : inputConstruct.getOperands()) {
+    bool b;
+    if (!matchPattern(operand, m_TorchConstantBool(&b))) {
+      allConstants = false;
+    } else if (!b) {
+      return getI1IntegerAttr(getContext(), false);
+    }
+  }
+  return allConstants ? getI1IntegerAttr(getContext(), true) : nullptr;
+}
+
+//===----------------------------------------------------------------------===//
 // AtenFloatScalarOp
 //===----------------------------------------------------------------------===//
 
@@ -5519,7 +5541,7 @@ public:
                           return std::get<0>(pair) == std::get<1>(pair);
                         }))
         return op.emitOpError(
-            "Failed to fold the _assert_tensor_metadata op since "
+            "Failed to canonicalize the _assert_tensor_metadata op since "
             "the sizes do not match");
     }
 
@@ -5535,7 +5557,7 @@ public:
         return failure();
       if (inputType.getDtype() != inputDtype)
         return op.emitOpError(
-            "Failed to fold the _assert_tensor_metadata op since "
+            "Failed to canonicalize the _assert_tensor_metadata op since "
             "the dtype does not match");
     }
 
