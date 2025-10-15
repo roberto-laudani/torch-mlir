@@ -14,6 +14,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/TorchToLinalg/Utils.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
@@ -553,6 +554,19 @@ public:
 
     SmallVector<Value> indicesVal =
         getTypeConvertedValues(rewriter, loc, getTypeConverter(), indicesTuple);
+
+    // Check if any of the index tensors are boolean masks (i1 element type)
+    // TODO(ROO-781): implement a lowering for this
+    for (auto index : indicesVal) {
+      if (!index) {
+        continue;
+      }
+      auto indexType = dyn_cast_if_present<RankedTensorType>(index.getType());
+      if (indexType && indexType.getElementType().isInteger(1)) {
+        return op.emitOpError(
+            "lowering with a boolean mask is not implemented");
+      }
+    }
 
     // Identify the indices with non-None index tensors and determine if they
     // are contiguous within the input list.
