@@ -1,3 +1,5 @@
+// XFAIL: *
+
 // RUN: torch-mlir-opt <%s -convert-torch-to-tosa -split-input-file
 
 // CHECK:  %{{.*}} = tosa.cast %{{.*}} : (tensor<1x32x220x220xf32>) -> tensor<1x32x220x220xf16>

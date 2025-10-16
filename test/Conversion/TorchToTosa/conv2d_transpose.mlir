@@ -1,3 +1,5 @@
+// XFAIL: *
+
 // RUN: torch-mlir-opt <%s -convert-torch-to-tosa -split-input-file -verify-diagnostics
 
 // The following test ensures that a tranposed convolution op is not

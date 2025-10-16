@@ -109,7 +109,7 @@ static std::string getConsumeReturnFunctionNameForReturnTypes(TypeRange types) {
     tokens.push_back(getTypeToken(type));
 
   return std::accumulate(tokens.begin(), tokens.end(), std::string(),
-                         [](std::string &a, std::string &b) {
+                         [](std::string a, std::string b) {
                            return a.empty() ? b : (a + "_" + b);
                          });
 }
@@ -361,7 +361,7 @@ class ExpandOpsForLLVM : public ExpandOpsForLLVMBase<ExpandOpsForLLVM> {
     auto func = getOperation();
     auto *context = &getContext();
     RewritePatternSet patterns(context);
-    populateExpandTanhPattern(patterns);
+    math::populateExpansionPatterns(patterns);
     patterns.add<math::ErfPolynomialApproximation>(patterns.getContext());
     ConversionTarget target(*context);
     target.addLegalDialect<func::FuncDialect>();
