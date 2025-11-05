@@ -20,6 +20,137 @@ using namespace mlir::torch::onnx_c;
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
     OnnxCustomOpConversionPattern &patterns) {
   patterns.onOp(
+      "SimplifiedLayerNormalization", 1,
+      [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        Torch::ValueTensorType yType;
+        Value x, scale;
+        int64_t axis, stashType;
+        float epsilon;
+        if (binder.tensorOperandAtIndex(x, 0) ||
+            binder.tensorOperandAtIndex(scale, 1) ||
+            binder.tensorResultTypeAtIndex(yType, 0) ||
+            binder.s64IntegerAttr(axis, "axis", -1) ||
+            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f) ||
+            binder.s64IntegerAttr(stashType, "stash_type", 1))
+          return failure();
+
+        std::optional<int64_t> stashTypeIntTorch =
+            onnxDtypeIntToTorchDtypeInt(stashType);
+        if (!stashTypeIntTorch.has_value())
+          return rewriter.notifyMatchFailure(
+              binder.op, "unimplemented support for the given stash_type");
+        FailureOr<Type> stashDtype = Torch::getTypeForScalarType(
+            binder.op->getContext(),
+            (torch_upstream::ScalarType)stashTypeIntTorch.value());
+        if (failed(stashDtype))
+          return failure();
+
+        // Build native layer norm with bias=None, as per the simplified
+        // signature.
+        Value biasNone =
+            rewriter.create<Torch::ConstantNoneOp>(binder.getLoc());
+        Value y, mean, rstd;
+        if (failed(buildNativeLayerNormOp(binder, rewriter, x, scale, biasNone,
+                                          yType, /*stashDtype=*/*stashDtype,
+                                          axis, epsilon, y, mean, rstd)))
+          return failure();
+
+        // Prepare final result list based on requested result types.
+        SmallVector<Value> results;
+        results.push_back(y);
+
+        int64_t numResults = binder.op->getNumResults();
+        auto pushOptionalResult = [&](int idx, Value &val) {
+          if (numResults <= idx)
+            return;
+          Type resTy = binder.op->getResult(idx).getType();
+          if (isa<Torch::NoneType>(resTy)) {
+            results.push_back(
+                rewriter.create<Torch::ConstantNoneOp>(binder.getLoc()));
+            return;
+          }
+          auto desiredTy = cast<Torch::ValueTensorType>(resTy);
+          auto curTy = cast<Torch::ValueTensorType>(val.getType());
+          if (desiredTy.getOptionalDtype() != curTy.getOptionalDtype())
+            val = Torch::convertTensorToDtype(rewriter, binder.getLoc(), val,
+                                              desiredTy.getDtype());
+          results.push_back(val);
+        };
+        pushOptionalResult(1, mean);
+        pushOptionalResult(2, rstd);
+
+        rewriter.replaceOp(binder.op, results);
+        return success();
+      });
+  patterns.onOp(
+      "SkipSimplifiedLayerNormalization", 1,
+      [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        Torch::ValueTensorType yType;
+        Value x, skip, scale;
+        float epsilon;
+        if (binder.tensorOperandAtIndex(x, 0) ||
+            binder.tensorOperandAtIndex(skip, 1) ||
+            binder.tensorOperandAtIndex(scale, 2) ||
+            binder.tensorResultTypeAtIndex(yType, 0) ||
+            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f))
+          return failure();
+
+        // Optional bias at operand 3.
+        Value bias;
+        if (binder.tensorOperandAtIndex(bias, 3))
+          bias = rewriter.create<Torch::ConstantNoneOp>(binder.getLoc());
+
+        // axis = last dimension (use -1 and rely on helper normalization)
+        Value y, mean, rstd;
+        if (failed(buildNativeLayerNormOp(binder, rewriter, x, scale, bias,
+                                          yType,
+                                          /*stashDtype=*/std::nullopt,
+                                          /*axis=*/-1, epsilon, y, mean, rstd)))
+          return failure();
+
+        SmallVector<Value> results;
+        results.push_back(y);
+
+        int64_t numResults = binder.op->getNumResults();
+        auto pushOptionalResultNoCast = [&](int idx, Value &val) {
+          if (numResults <= idx)
+            return;
+          Type resTy = binder.op->getResult(idx).getType();
+          if (isa<Torch::NoneType>(resTy))
+            results.push_back(
+                rewriter.create<Torch::ConstantNoneOp>(binder.getLoc()));
+          else
+            results.push_back(val);
+        };
+        pushOptionalResultNoCast(1, mean);
+        pushOptionalResultNoCast(2, rstd);
+
+        if (numResults == 4) {
+          // Validate/derive skip result type at index 3 when present.
+          Type res3Ty = binder.op->getResult(3).getType();
+          auto skipType = dyn_cast<Torch::ValueTensorType>(res3Ty);
+          if (!skipType && !isa<Torch::NoneType>(res3Ty))
+            return failure();
+          Value alpha = rewriter.create<Torch::ConstantFloatOp>(
+              binder.getLoc(), rewriter.getF64FloatAttr(1.0));
+          if (isa<Torch::NoneType>(res3Ty)) {
+            results.push_back(
+                rewriter.create<Torch::ConstantNoneOp>(binder.getLoc()));
+          } else {
+            Value inputSkipBiasSum = rewriter.create<Torch::AtenAddTensorOp>(
+                binder.getLoc(), skipType ? skipType : yType, x, skip, alpha);
+            if (!isa<Torch::NoneType>(bias.getType()))
+              inputSkipBiasSum = rewriter.create<Torch::AtenAddTensorOp>(
+                  binder.getLoc(), skipType ? skipType : yType,
+                  inputSkipBiasSum, bias, alpha);
+            results.push_back(inputSkipBiasSum);
+          }
+        }
+
+        rewriter.replaceOp(binder.op, results);
+        return success();
+      });
+  patterns.onOp(
       "RotaryEmbedding", 1,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Location loc = binder.getLoc();

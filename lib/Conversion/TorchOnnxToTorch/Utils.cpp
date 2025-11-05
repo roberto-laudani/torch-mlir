@@ -143,6 +143,73 @@ Value mlir::torch::onnx_c::createActivationByName(ImplicitLocOpBuilder &b,
   llvm_unreachable("Unsupported activation function");
 }
 
+LogicalResult mlir::torch::onnx_c::buildNativeLayerNormOp(
+    OpBinder binder, ConversionPatternRewriter &rewriter, Value &input,
+    Value scale, Value bias, Torch::ValueTensorType yType,
+    std::optional<Type> stashDtype, int64_t axisRaw, float epsilon, Value &outY,
+    Value &outMean, Value &outRstd) {
+  auto xType = dyn_cast<Torch::ValueTensorType>(input.getType());
+  if (!xType || !xType.hasSizes())
+    return rewriter.notifyMatchFailure(binder.op,
+                                       "Expected input (X) to have sizes");
+
+  ArrayRef<int64_t> xShape = xType.getSizes();
+  int64_t rank = static_cast<int64_t>(xShape.size());
+  int64_t axis = Torch::toPositiveDim(axisRaw, rank);
+  if (!Torch::isValidDim(axis, rank))
+    return rewriter.notifyMatchFailure(binder.op, "axis out of range");
+
+  // Optionally cast X to stash dtype.
+  Type internalDtype = xType.getOptionalDtype();
+  if (stashDtype && *stashDtype != internalDtype) {
+    input = Torch::convertTensorToDtype(rewriter, binder.getLoc(), input,
+                                        *stashDtype);
+    xType = cast<Torch::ValueTensorType>(input.getType());
+    internalDtype = *stashDtype;
+  }
+
+  // epsilon constant
+  Value constEpsilon = rewriter.create<Torch::ConstantFloatOp>(
+      binder.getLoc(), rewriter.getType<Torch::FloatType>(),
+      rewriter.getF64FloatAttr(epsilon));
+
+  // normalized_shape list
+  SmallVector<Value> normVals;
+  normVals.reserve(rank - axis);
+  for (int64_t d = axis; d < rank; ++d) {
+    if (xShape[d] == Torch::kUnknownSize) {
+      Value cstDim = rewriter.create<Torch::ConstantIntOp>(
+          binder.getLoc(), rewriter.getI64IntegerAttr(d));
+      normVals.push_back(rewriter.create<Torch::AtenSizeIntOp>(binder.getLoc(),
+                                                               input, cstDim));
+    } else {
+      normVals.push_back(rewriter.create<Torch::ConstantIntOp>(
+          binder.getLoc(), rewriter.getI64IntegerAttr(xShape[d])));
+    }
+  }
+  Value normalizedShapeList = rewriter.create<Torch::PrimListConstructOp>(
+      binder.getLoc(),
+      Torch::ListType::get(Torch::IntType::get(binder.op->getContext())),
+      normVals);
+
+  // reduced type for mean/rstd
+  SmallVector<int64_t> reducedShape(rank, 1);
+  for (int64_t i = 0; i < axis; ++i)
+    reducedShape[i] = xShape[i];
+  auto reducedType = xType.getWithSizesAndDtype(reducedShape, internalDtype);
+
+  // Build native_layer_norm
+  auto native = rewriter.create<Torch::AtenNativeLayerNormOp>(
+      binder.getLoc(), yType, /*meanType=*/reducedType,
+      /*invStdDevType=*/reducedType, input, normalizedShapeList, scale, bias,
+      constEpsilon);
+
+  outY = native.getResult0();
+  outMean = native.getResult1();
+  outRstd = native.getResult2();
+  return success();
+}
+
 LogicalResult mlir::torch::onnx_c::extractPerTensorQuantizationArguments(
     ConversionPatternRewriter &rewriter, Location loc, Value inScale,
     Value inZeroPoint, Value &outScale, Value &outZeroPoint) {

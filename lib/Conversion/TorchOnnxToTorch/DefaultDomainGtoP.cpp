@@ -2625,7 +2625,7 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
   patterns.onOp(
       "LayerNormalization", 17,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
-        Torch::ValueTensorType yType, meanType, invStdDevType;
+        Torch::ValueTensorType yType;
         Value x, scale, b;
         int64_t axis, stashType;
         float epsilon;
@@ -2649,81 +2649,35 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
         if (failed(stashDtype))
           return failure();
 
-        // Convert dtype if stash_type is different from input dtype
-        auto xType = cast<Torch::ValueTensorType>(x.getType());
-        Value cstFalse =
-            rewriter.create<Torch::ConstantBoolOp>(binder.getLoc(), false);
-        Value none = rewriter.create<Torch::ConstantNoneOp>(binder.getLoc());
-        if (*stashDtype != xType.getOptionalDtype()) {
-          auto newXType =
-              xType.getWithSizesAndDtype(xType.getOptionalSizes(), *stashDtype);
-          Value dtypeValue = rewriter.create<Torch::ConstantIntOp>(
-              binder.getLoc(),
-              rewriter.getI64IntegerAttr(stashTypeIntTorch.value()));
-          x = rewriter.create<Torch::AtenToDtypeOp>(
-              binder.getLoc(), newXType, x, /*dtype=*/dtypeValue,
-              /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
-              /*memory_format=*/none);
-        }
-
-        Value constEpsilon = rewriter.create<Torch::ConstantFloatOp>(
-            binder.getLoc(), rewriter.getType<Torch::FloatType>(),
-            rewriter.getF64FloatAttr(epsilon));
-        unsigned rank = 1;
-        if (std::optional<unsigned> maybeRank = Torch::getTensorRank(x))
-          rank = *maybeRank;
-        SmallVector<Value> normalized;
-        axis = Torch::toPositiveDim(axis, rank);
-        if (!xType.hasSizes()) {
-          return rewriter.notifyMatchFailure(
-              binder.op, "Expected input (X) to have sizes");
-        }
-        ArrayRef<int64_t> xShape = xType.getSizes();
-        for (int64_t n = axis; n < rank; n++) {
-          normalized.push_back(rewriter.create<Torch::ConstantIntOp>(
-              binder.getLoc(), rewriter.getI64IntegerAttr(xShape[n])));
-        }
-        Value normalized_shape = rewriter.create<Torch::PrimListConstructOp>(
-            binder.getLoc(),
-            Torch::ListType::get(Torch::IntType::get(binder.op->getContext())),
-            normalized);
-
-        SmallVector<int64_t> reducedShape(rank, 1);
-        for (int64_t i = 0; i < axis; i++)
-          reducedShape[i] = xShape[i];
-        auto reducedType =
-            xType.getWithSizesAndDtype(reducedShape, *stashDtype);
-        auto y = rewriter.create<Torch::AtenNativeLayerNormOp>(
-            binder.getLoc(), yType, /*meanType=*/reducedType,
-            /*invStdDevType=*/reducedType, x, normalized_shape, scale, b,
-            constEpsilon);
-
-        int64_t numResults = binder.op->getNumResults();
-        if (numResults == 1) {
-          rewriter.replaceOp(binder.op, y.getResult0());
-          return success();
-        }
-
-        Value meanOutput = y.getResult1();
-        Value varOutput = y.getResult2();
-        // Convert meanType and varType back if stash_dtype is different
-        if (binder.tensorResultTypeAtIndex(meanType, 1) ||
-            binder.tensorResultTypeAtIndex(invStdDevType, 2))
+        Value y, mean, rstd;
+        if (failed(buildNativeLayerNormOp(binder, rewriter, x, scale, b, yType,
+                                          /*stashDtype=*/*stashDtype, axis,
+                                          epsilon, y, mean, rstd)))
           return failure();
-        if (*stashDtype != meanType.getOptionalDtype()) {
-          Value constDtype = Torch::getDtypeIntValueForType(
-              rewriter, binder.getLoc(), meanType.getDtype());
-          meanOutput = rewriter.create<Torch::AtenToDtypeOp>(
-              binder.getLoc(), meanType, meanOutput, /*dtype=*/constDtype,
-              /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
-              /*memory_format=*/none);
-          varOutput = rewriter.create<Torch::AtenToDtypeOp>(
-              binder.getLoc(), invStdDevType, varOutput, /*dtype=*/constDtype,
-              /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
-              /*memory_format=*/none);
-        }
-        rewriter.replaceOp(binder.op, {y.getResult0(), meanOutput, varOutput});
 
+        SmallVector<Value> results;
+        results.push_back(y);
+        int64_t numResults = binder.op->getNumResults();
+        auto pushOptionalResult = [&](int idx, Value &val) {
+          if (numResults <= idx)
+            return;
+          Type resTy = binder.op->getResult(idx).getType();
+          if (isa<Torch::NoneType>(resTy)) {
+            results.push_back(
+                rewriter.create<Torch::ConstantNoneOp>(binder.getLoc()));
+            return;
+          }
+          auto desiredTy = cast<Torch::ValueTensorType>(resTy);
+          auto curTy = cast<Torch::ValueTensorType>(val.getType());
+          if (desiredTy.getOptionalDtype() != curTy.getOptionalDtype())
+            val = Torch::convertTensorToDtype(rewriter, binder.getLoc(), val,
+                                              desiredTy.getDtype());
+          results.push_back(val);
+        };
+        pushOptionalResult(1, mean);
+        pushOptionalResult(2, rstd);
+
+        rewriter.replaceOp(binder.op, results);
         return success();
       });
   patterns.onOp("LeakyRelu", 1,

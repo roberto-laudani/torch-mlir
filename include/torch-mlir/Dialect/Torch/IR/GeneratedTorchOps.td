@@ -7502,6 +7502,36 @@ def Torch_AtenLayerNormOp : Torch_Op<"aten.layer_norm", [
   }];
 }
 
+def Torch_AtenSkipLayerNormOp : Torch_Op<"aten.skip_layer_norm", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Generated op for `aten::skip_layer_norm : (Tensor, Tensor, Tensor?, Tensor?, float) -> (Tensor, Tensor, Tensor, Tensor)`";
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    AnyTorchTensorType:$skip,
+    AnyTorchOptionalTensorType:$weight,
+    AnyTorchOptionalTensorType:$bias,
+    Torch_FloatType:$eps
+  );
+  let results = (outs
+    AnyTorchOptionalTensorType:$result0,
+    AnyTorchOptionalTensorType:$result1,
+    AnyTorchOptionalTensorType:$result2,
+    AnyTorchOptionalTensorType:$result3
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult AtenSkipLayerNormOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 5, 4);
+    }
+    void AtenSkipLayerNormOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 5, 4);
+    }
+  }];
+}
+
 def Torch_AtenRmsNormOp : Torch_Op<"aten.rms_norm", [
     AllowsTypeRefinement,
     HasValueSemantics,

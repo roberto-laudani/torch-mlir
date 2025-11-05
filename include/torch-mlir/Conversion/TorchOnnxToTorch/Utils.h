@@ -130,6 +130,21 @@ LogicalResult createDequantizeTensor(ConversionPatternRewriter &rewriter,
                                      Location loc, Value input, Value scale,
                                      Value zeroPoint, Value &output);
 
+/// This utility builds a torch.aten.native_layer_norm from layer norm inputs
+/// and parameters that are common to ONNX versions of layer normalization.
+///
+/// - Applies reduction starting from the axis provided
+/// - Optionally casts input to `stashDtype` (if provided and different)
+///   before normalization. Mean and inverse standard variance are produced
+///   in the reduced type with the appropriate data type.
+///
+/// Returns the three results of aten.native_layer_norm via out* parameters.
+LogicalResult buildNativeLayerNormOp(
+    OpBinder binder, ConversionPatternRewriter &rewriter, Value &input,
+    Value scale, Value bias, Torch::ValueTensorType yType,
+    std::optional<Type> stashDtype /*nullopt -> keep x dtype*/, int64_t axis,
+    float epsilon, Value &outY, Value &outMean, Value &outRstd);
+
 } // namespace mlir::torch::onnx_c
 
 #endif // TORCHMLIR_CONVERSION_TORCHONNXTOTORCH_UTILS_H
