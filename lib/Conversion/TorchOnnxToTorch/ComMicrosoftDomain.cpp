@@ -258,6 +258,33 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         return success();
       });
   patterns.onOp(
+      "QuickGelu", 1, [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        Location loc = binder.getLoc();
+        Value input;
+        float alpha;
+        if (binder.tensorOperandAtIndex(input, 0) ||
+            binder.f32FloatAttr(alpha, "alpha", 1.0)) {
+          return rewriter.notifyMatchFailure(
+              binder.op, "Failed to get required input and attribute values");
+        }
+        auto inputType = cast<Torch::ValueTensorType>(input.getType());
+        Torch::ValueTensorType resultType;
+        if (binder.tensorResultType(resultType) || resultType != inputType) {
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "Input and result type mismatch");
+        }
+        Value constAlpha = rewriter.create<Torch::ConstantFloatOp>(
+            loc, rewriter.getType<Torch::FloatType>(),
+            rewriter.getF64FloatAttr((double)alpha));
+        auto scaleMul = rewriter.create<Torch::AtenMulScalarOp>(
+            loc, inputType, input, constAlpha);
+        auto sigmoid =
+            rewriter.create<Torch::AtenSigmoidOp>(loc, inputType, scaleMul);
+        rewriter.replaceOpWithNewOp<Torch::AtenMulTensorOp>(
+            binder.op, resultType, input, sigmoid);
+        return success();
+      });
+  patterns.onOp(
       "RotaryEmbedding", 1,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Location loc = binder.getLoc();
