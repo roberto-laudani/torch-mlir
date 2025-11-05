@@ -27,6 +27,7 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/Support/ErrorHandling.h"
+#include <mlir/IR/BuiltinAttributes.h>
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -1896,11 +1897,14 @@ public:
       }
     }
 
+    auto scaleAttr = mlir::FloatAttr{};
     if (!isa<Torch::NoneType>(scale.getType())) {
       double scaleFloat;
-      if (!matchPattern(scale, m_TorchConstantFloat(&scaleFloat)) ||
-          scaleFloat != 1.0)
-        return rewriter.notifyMatchFailure(loc, "only default scale supported");
+      if (!matchPattern(scale, m_TorchConstantFloat(&scaleFloat))) {
+        return rewriter.notifyMatchFailure(loc,
+                                           "only constant scale supported");
+      }
+      scaleAttr = rewriter.getF64FloatAttr(scaleFloat);
     }
 
     if (queryTy.getRank() != valueTy.getRank() ||
@@ -1980,10 +1984,11 @@ public:
     }
 
     // Overwrite with tm_tensor::attention
-    Value attention = rewriter
-                          .create<AttentionOp>(loc, outType, inputs,
-                                               SmallVector<Value>{output})
-                          .getResult()[0];
+    Value attention =
+        rewriter
+            .create<AttentionOp>(loc, outType, inputs,
+                                 SmallVector<Value>{output}, scaleAttr)
+            .getResult()[0];
 
     if (opTy != outType) {
       attention = rewriter.create<tensor::ExpandShapeOp>(loc, opTy, attention,

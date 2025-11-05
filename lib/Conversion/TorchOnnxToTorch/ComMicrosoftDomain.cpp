@@ -384,11 +384,11 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               binder.op,
               "num_heads is a required attribute and should be non-zero");
 
-        if (smoothSoftmax != 0)
+        if (smoothSoftmax != 0 && smoothSoftmax != -1)
           return rewriter.notifyMatchFailure(
               binder.op,
               "Unimplemented: smooth_softmax attribute is not supported, hence "
-              "it should have default value equal to 0");
+              "it should have default value equal to 0 or -1");
 
         if (softcap != 0.0f)
           return rewriter.notifyMatchFailure(
@@ -414,10 +414,11 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
 
         Torch::ValueTensorType queryType =
             cast<Torch::ValueTensorType>(query.getType());
-        if (!(queryType.hasSizes() && queryType.areAllSizesKnown()))
-          return rewriter.notifyMatchFailure(
-              binder.op,
-              "Expected `query` input to have statically known sizes");
+        if (!queryType.hasSizes() ||
+            queryType.getSizes()[2] == ShapedType::kDynamic)
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "Expected `query` input to have "
+                                             "statically known hidden size");
 
         SmallVector<int64_t> queryDims{queryType.getSizes()};
         int64_t batchSize = queryDims[0];
