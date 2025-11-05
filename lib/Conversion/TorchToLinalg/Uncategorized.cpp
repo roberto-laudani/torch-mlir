@@ -25,6 +25,7 @@
 #include "torch-mlir/Dialect/Torch/Utils/TorchUpstream.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
 #include "llvm/ADT/APSInt.h"
+#include <cstdint>
 #include <numeric>
 #include <string>
 #include <type_traits>
@@ -3652,11 +3653,12 @@ private:
     int64_t rotaryEmbeddingDim;
     int64_t numHeads;
     int64_t maxSequenceLength;
+    bool isFourDimLayout;
   };
 
   static LogicalResult checkInputs(OnnxVariantRotaryEmbeddingOp op, Value input,
                                    Value positionIds, Value cosCache,
-                                   Value sinCache, int64_t numHeads,
+                                   Value sinCache, int64_t attrNumHeads,
                                    int64_t rotaryEmbeddingDim,
                                    RotaryParameters &parameters,
                                    ConversionPatternRewriter &rewriter) {
@@ -3672,23 +3674,15 @@ private:
 
     // Check input
     RankedTensorType inputType = cast<RankedTensorType>(input.getType());
-    if (!inputType.hasStaticShape())
-      return rewriter.notifyMatchFailure(
-          op, "Unimplemented: expected input to have static shape");
 
-    // TODO: Add support for 3d input of shape: (batch_size, sequence_length,
-    // hidden_size)
     SmallVector<int64_t> inputShape{inputType.getShape()};
-    if (inputShape.size() != 4)
-      return rewriter.notifyMatchFailure(op,
-                                         "input is expected to have rank 4");
+    if (inputShape.size() != 3 && inputShape.size() != 4)
+      return rewriter.notifyMatchFailure(
+          op, "input is expected to have rank 3 or 4");
 
     // Check position_ids
     RankedTensorType positionIdsType =
         cast<RankedTensorType>(positionIds.getType());
-    if (!positionIdsType.hasStaticShape())
-      return rewriter.notifyMatchFailure(
-          op, "Unimplemented: expected position_ids to have static shape");
 
     SmallVector<int64_t> positionIdsShape{positionIdsType.getShape()};
     if (positionIdsShape.size() != 2)
@@ -3736,29 +3730,45 @@ private:
           op, "Unimplemented: expected position_ids to be of integer type");
 
     // Check num_heads and rotary_embedding_dim
-    if (rotaryEmbeddingDim > 0 && numHeads == 0)
+    if (rotaryEmbeddingDim > 0 && attrNumHeads == 0)
       return rewriter.notifyMatchFailure(
           op,
           "num_heads must be non-zero if rotary_embedding_dim is specified");
 
     // Get attributes from inputs
+    const bool isFourDimLayout = inputShape.size() == 4;
+    parameters.isFourDimLayout = isFourDimLayout;
     int64_t batchSize = inputShape[0];
-    int64_t sequenceLength = inputShape[2];
-    int64_t hiddenSize = inputShape[1] * inputShape[3];
+    int64_t sequenceLength = isFourDimLayout ? inputShape[2] : inputShape[1];
+    int64_t hiddenSize =
+        isFourDimLayout ? inputShape[1] * inputShape[3] : inputShape[2];
     int maxSequenceLength = cosCacheShape[0];
-    int headSize = rotaryEmbeddingDim == 0 ? cosCacheShape[1] * 2
-                                           : (int64_t)(hiddenSize / numHeads);
+    int64_t headSize = 0;
+    int64_t numHeads = isFourDimLayout ? inputShape[1] : attrNumHeads;
+    if (isFourDimLayout)
+      headSize = inputShape[3];
+    else if (numHeads > 0)
+      headSize = hiddenSize / numHeads;
+    else {
+      if (rotaryEmbeddingDim > 0)
+        headSize = rotaryEmbeddingDim;
+      else
+        headSize = cosCacheShape[1] * 2;
+      numHeads = hiddenSize / headSize;
+    }
 
     if (rotaryEmbeddingDim > 0 && rotaryEmbeddingDim > headSize)
       return rewriter.notifyMatchFailure(
           op, "rotary_embedding_dim must be less than or equal to head_size");
 
     // Check position_ids input shapes
-    if (positionIdsShape[0] != batchSize)
+    if (positionIdsShape[0] != batchSize &&
+        !ShapedType::isDynamic(positionIdsShape[0]))
       return rewriter.notifyMatchFailure(
           op, "position_ids shape dimension 0 should be of size batch_size");
 
-    if (positionIdsShape[1] != sequenceLength)
+    if (positionIdsShape[1] != sequenceLength &&
+        !ShapedType::isDynamic(positionIdsShape[1]))
       return rewriter.notifyMatchFailure(
           op,
           "position_ids shape dimension 1 should be of size sequence_length");
@@ -3770,8 +3780,6 @@ private:
       return rewriter.notifyMatchFailure(
           op, "cos_cache shape dimension 1 should be equal to head_size / 2 "
               "or rotary_embedding_dim / 2");
-
-    numHeads = numHeads > 0 ? numHeads : (int64_t)(hiddenSize / headSize);
 
     parameters.batchSize = batchSize;
     parameters.sequenceLength = sequenceLength;
@@ -3838,15 +3846,49 @@ private:
       return rewriter.notifyMatchFailure(
           op, "Failed to satisfy the constraints in checkInputs function");
 
+    Value preprocessedInput = input;
+    RankedTensorType preprocessedInputType = inputType;
+    SmallVector<int64_t> inputShape{inputType.getShape()};
+    const bool isFourDimLayout = inputShape.size() == 4;
+    // Normalize 3-dim ops with b*s*(n*h) layout to 4-dim computation over a
+    // b*n*s*h layout. The sequence is:
+    //   expand -> transpose -> compute -> transpose -> collapse
+    if (!isFourDimLayout) {
+      SmallVector<int64_t> expandedShape{inputShape[0], inputShape[1],
+                                         parameters.numHeads,
+                                         parameters.headSize};
+      auto expandedType =
+          RankedTensorType::get(expandedShape, inputType.getElementType());
+      SmallVector<ReassociationIndices> reassociation{{0}, {1}, {2, 3}};
+      Value expandedInput = rewriter.create<tensor::ExpandShapeOp>(
+          loc, expandedType, input, reassociation);
+      SmallVector<int64_t> transposedIndices{0, 2, 1, 3};
+      SmallVector<int64_t> transposedShape(4);
+      SmallVector<Value, 4> transposeOperands;
+      for (int i = 0; i < 4; ++i) {
+        int transposedIdx = transposedIndices[i];
+        transposedShape[i] = expandedShape[transposedIdx];
+        transposeOperands.push_back(
+            rewriter.create<tensor::DimOp>(loc, expandedInput, transposedIdx));
+      }
+      Value transposedIndicesVal =
+          rewriter.create<tensor::FromElementsOp>(loc, transposeOperands);
+      preprocessedInputType =
+          RankedTensorType::get(transposedShape, inputType.getElementType());
+      preprocessedInput = rewriter.create<tensor::ReshapeOp>(
+          loc, preprocessedInputType, expandedInput, transposedIndicesVal);
+    }
+
     rotaryEmbeddingDim = parameters.rotaryEmbeddingDim;
     int64_t halfRotaryEmbDim = rotaryEmbeddingDim / 2;
 
-    auto elementType = inputType.getElementType();
-    unsigned inputRank = inputType.getRank();
+    auto elementType = preprocessedInputType.getElementType();
+    unsigned inputRank = preprocessedInputType.getRank();
 
     SmallVector<Value> resultShape;
     for (int64_t i = 0; i < inputRank; i++) {
-      auto currentDimSize = rewriter.create<tensor::DimOp>(loc, input, i);
+      auto currentDimSize =
+          rewriter.create<tensor::DimOp>(loc, preprocessedInput, i);
       resultShape.push_back(currentDimSize);
     }
     Value outTensor =
@@ -3877,8 +3919,9 @@ private:
     auto rotaryEmbedding =
         rewriter
             .create<linalg::GenericOp>(
-                loc, outTensor.getType(), ValueRange{input, positionIds},
-                outTensor, indexingMaps, iteratorTypes,
+                loc, outTensor.getType(),
+                ValueRange{preprocessedInput, positionIds}, outTensor,
+                indexingMaps, iteratorTypes,
                 [&](OpBuilder &builder, Location loc, ValueRange args) {
                   // This linalg.generic will be iterating over the 4 dimensions
                   // of the input "b, n, s, h", respectively.
@@ -3939,7 +3982,8 @@ private:
 
                   Value origInput = args[0];
                   Value rotatedInput = builder.create<tensor::ExtractOp>(
-                      loc, input, ValueRange{b, n, s, rotatedInputLastIdx});
+                      loc, preprocessedInput,
+                      ValueRange{b, n, s, rotatedInputLastIdx});
 
                   Value signMultiplier = builder.create<arith::SelectOp>(
                       loc, sign, cstFloatOne, cstFloatMinusOne);
@@ -3956,8 +4000,32 @@ private:
                 })
             .getResult(0);
 
-    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType,
-                                                rotaryEmbedding);
+    if (isFourDimLayout) {
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType,
+                                                  rotaryEmbedding);
+      return success();
+    }
+    auto nonTransposedResult = rewriter.create<tensor::CastOp>(
+        loc, preprocessedInputType, rotaryEmbedding);
+    SmallVector<int64_t> nonTransposedShape(preprocessedInputType.getShape());
+    SmallVector<int64_t> transposedIndices{0, 2, 1, 3};
+    SmallVector<int64_t> transposedShape(4);
+    SmallVector<Value, 4> transposeOperands;
+    for (int i = 0; i < 4; ++i) {
+      int transposedIdx = transposedIndices[i];
+      transposedShape[i] = nonTransposedShape[transposedIdx];
+      transposeOperands.push_back(rewriter.create<tensor::DimOp>(
+          loc, nonTransposedResult, transposedIdx));
+    }
+    Value transposedIndicesVal =
+        rewriter.create<tensor::FromElementsOp>(loc, transposeOperands);
+    auto nonCollapsedOutputType =
+        RankedTensorType::get(transposedShape, resultType.getElementType());
+    Value transposedResult = rewriter.create<tensor::ReshapeOp>(
+        loc, nonCollapsedOutputType, nonTransposedResult, transposedIndicesVal);
+    SmallVector<ReassociationIndices> reassociation{{0}, {1}, {2, 3}};
+    rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(
+        op, resultType, transposedResult, reassociation);
     return success();
   }
 };
