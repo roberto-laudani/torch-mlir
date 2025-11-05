@@ -281,12 +281,6 @@ public:
     bool isUnsigned = torch_to_linalg::isUnsignedTorchType(lhsTorchType);
     bool isUnsignedR = torch_to_linalg::isUnsignedTorchType(rhsTorchType);
 
-    if (!lhsZeroPoint && lhsTorchType.getDtype() != rhsTorchType.getDtype()) {
-      // Allows quantized types to mismatch
-      return rewriter.notifyMatchFailure(
-          op, "unsupported: aten.matmul with different input element types");
-    }
-
     Type newResultType = getTypeConverter()->convertType(op.getType());
     auto resultType = cast<RankedTensorType>(newResultType);
     Type elementType = resultType.getElementType();

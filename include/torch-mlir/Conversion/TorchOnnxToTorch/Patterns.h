@@ -83,10 +83,16 @@ struct OpBinder {
     return success();
   }
 
-  ParseResult tensorOperandAtIndex(Value &valueIdx, int64_t idx) {
+  ParseResult anyOperandAtIndex(Value &valueIdx, int64_t idx) {
     if (idx >= op->getNumOperands())
       return failure();
     valueIdx = op->getOperand(idx);
+    return success();
+  }
+
+  ParseResult tensorOperandAtIndex(Value &valueIdx, int64_t idx) {
+    if (failed(anyOperandAtIndex(valueIdx, idx)))
+      return failure();
     if (!toValidTensorType(valueIdx.getType()))
       return failure();
     return success();

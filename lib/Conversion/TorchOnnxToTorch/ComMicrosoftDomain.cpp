@@ -151,6 +151,113 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         return success();
       });
   patterns.onOp(
+      "MatMulIntegerToFloat", 1,
+      [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        // This op:
+        //     onnx.MatMulIntegerToFloat(
+        //         lhs, rhs, lhs_scale, rhs_scale,
+        //         [lhs_zp, rhs_zp, bias])
+        //     -> fpType{dtype.float32, dtype.float16}
+        //
+        // has the following intermediate lowering:
+        //     mm = onnx.MatMulInteger(lhs, rhs, lhs_zp, rhs_zp)
+        //              -> dtype.int32
+        //     mm_float = mm.to(dtype=fpType)
+        //     mm_scaled_l = mm_float * lhs_scale
+        //     mm_scaled_full = mm_scaled_l * rhs_scale
+        //     res = mm_scaled_full + bias
+        //
+        // TODO: MatMulInteger should become a generated op, and we should
+        // actually generate it here as an intermediate step, as opposed to
+        // replicating the full lowering logic for MatMulInteger.
+        Location loc = binder.getLoc();
+        Torch::ValueTensorType resultType;
+        Value lhs, rhs, lhsScale, rhsScale, lhsZeroPoint, rhsZeroPoint, bias;
+        if (binder.tensorOperandAtIndex(lhs, 0) ||
+            binder.tensorOperandAtIndex(rhs, 1) ||
+            binder.anyOperandAtIndex(lhsScale, 2) ||
+            binder.anyOperandAtIndex(rhsScale, 3) ||
+            binder.tensorResultType(resultType))
+          return failure();
+
+        // TODO: i8/si8 and result type constraint checks
+
+        // Subtracting the zero_point values from lhs and rhs.
+        Value alpha = rewriter.create<Torch::ConstantIntOp>(
+            loc, rewriter.getI64IntegerAttr(1));
+        if (!binder.anyOperandAtIndex(lhsZeroPoint, 4)) {
+          if (isa<Torch::ValueTensorType>(lhsZeroPoint.getType()))
+            lhs = rewriter.create<Torch::AtenSubTensorOp>(
+                loc, lhs.getType(), lhs, lhsZeroPoint, alpha);
+          else
+            lhs = rewriter.create<Torch::AtenSubScalarOp>(
+                loc, lhs.getType(), lhs, lhsZeroPoint, alpha);
+        }
+        if (!binder.anyOperandAtIndex(rhsZeroPoint, 5)) {
+          if (isa<Torch::ValueTensorType>(rhsZeroPoint.getType()))
+            rhs = rewriter.create<Torch::AtenSubTensorOp>(
+                loc, rhs.getType(), rhs, rhsZeroPoint, alpha);
+          else
+            rhs = rewriter.create<Torch::AtenSubScalarOp>(
+                loc, rhs.getType(), rhs, rhsZeroPoint, alpha);
+        }
+
+        auto *ctx = binder.op->getContext();
+        auto matMulTy = Torch::ValueTensorType::get(
+            ctx, resultType.getSizes(),
+            mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Signed));
+        auto matmul =
+            rewriter.create<Torch::AtenMatmulOp>(loc, matMulTy, lhs, rhs);
+        auto matmulFloat = Torch::convertTensorToDtype(rewriter, loc, matmul,
+                                                       resultType.getDtype());
+
+        auto lhsScaleTy = lhsScale.getType();
+        auto lhsScaleTensorTy = dyn_cast<Torch::ValueTensorType>(lhsScaleTy);
+        auto rhsScaleTy = rhsScale.getType();
+        auto rhsScaleTensorTy = dyn_cast<Torch::ValueTensorType>(rhsScaleTy);
+        // TODO: Also check underlying types match & constraint.
+        const bool isLhsTrueTensor =
+            lhsScaleTensorTy && !lhsScaleTensorTy.getSizes().empty();
+        const bool isRhsTrueTensor =
+            rhsScaleTensorTy && !rhsScaleTensorTy.getSizes().empty();
+        if (isLhsTrueTensor && isRhsTrueTensor)
+          return failure();
+
+        Value scaleProduct;
+        auto scaleProdTy = lhsScaleTensorTy;
+        if (isRhsTrueTensor || !lhsScaleTensorTy)
+          scaleProdTy = rhsScaleTensorTy;
+        Value mulLhs = lhsScaleTensorTy ? lhsScale : rhsScale;
+        Value mulRhs = lhsScaleTensorTy ? rhsScale : lhsScale;
+        if (lhsScaleTensorTy && rhsScaleTensorTy)
+          scaleProduct = rewriter.create<Torch::AtenMulTensorOp>(
+              loc, scaleProdTy, mulLhs, mulRhs);
+        else if (lhsScaleTensorTy || rhsScaleTensorTy)
+          scaleProduct = rewriter.create<Torch::AtenMulScalarOp>(
+              loc, scaleProdTy, mulLhs, mulRhs);
+        else
+          scaleProduct = rewriter.create<Torch::AtenMulOp>(loc, lhsScaleTy,
+                                                           lhsScale, rhsScale);
+
+        Value scaledMatmul;
+        if (isa<Torch::ValueTensorType>(scaleProduct.getType()))
+          scaledMatmul = rewriter.create<Torch::AtenMulTensorOp>(
+              loc, resultType, matmulFloat, scaleProduct);
+        else
+          scaledMatmul = rewriter.create<Torch::AtenMulScalarOp>(
+              loc, resultType, matmulFloat, scaleProduct);
+        // TODO: Check bias type constraints as well...
+        if (binder.tensorOperandAtIndex(bias, 6))
+          rewriter.replaceOp(binder.op, scaledMatmul);
+        else {
+          Value alphaFP = rewriter.create<Torch::ConstantFloatOp>(
+              binder.getLoc(), rewriter.getF64FloatAttr(1.0));
+          rewriter.replaceOpWithNewOp<Torch::AtenAddTensorOp>(
+              binder.op, resultType, scaledMatmul, bias, alphaFP);
+        }
+        return success();
+      });
+  patterns.onOp(
       "RotaryEmbedding", 1,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Location loc = binder.getLoc();
