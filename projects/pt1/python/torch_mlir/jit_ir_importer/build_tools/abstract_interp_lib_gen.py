@@ -1297,6 +1297,10 @@ def aten〇avg_pool1d〡shape(self: List[int], kernel_size: List[int], stride: L
 def aten〇max_pool1d〡shape(self: List[int], kernel_size: List[int], stride: List[int] = (), padding: List[int] = (0,), dilation: List[int] = (1,), ceil_mode: bool = False) -> List[int]:
     return pool1d(self, kernel_size, stride, padding, ceil_mode)
 
+def aten〇max_pool1d_with_indices〡shape(self: List[int], kernel_size: List[int], stride: List[int] = (), padding: List[int] = (0,), dilation: List[int] = (1,), ceil_mode: bool = False) -> Tuple[List[int], List[int]]:
+    maxpool1d = indices = pool1d(self, kernel_size, stride, padding, ceil_mode)
+    return maxpool1d, indices
+
 def aten〇adaptive_avg_pool1d〡shape(self: List[int], output_size: List[int]) -> List[int]:
     return adaptive_avg_pool1d(self, output_size)
 
@@ -3636,6 +3640,10 @@ def aten〇max_pool1d〡dtype(self_rank_dtype: Tuple[int, int], kernel_size: Lis
     self_rank, self_dtype = self_rank_dtype
     return self_dtype
 
+def aten〇max_pool1d_with_indices〡dtype(self_rank_dtype: Tuple[int, int], kernel_size: List[int], stride: List[int] = (), padding: List[int] = (0,), dilation: List[int] = (1,), ceil_mode: bool = False) -> Tuple[int, int]:
+    self_rank, self_dtype = self_rank_dtype
+    return self_dtype, torch.int64
+
 @check_dtype_function(_check_tensors_with_the_same_dtype(tensor_shapes=[(2, 3, 5, 7)], kernel_size=[2, 2]))
 def aten〇max_pool2d〡dtype(self_rank_dtype: Tuple[int, int], kernel_size: List[int], stride: List[int] = (), padding: List[int] = (0, 0,), dilation: List[int] = (1, 1,), ceil_mode: bool = False) -> int:
     self_rank, self_dtype = self_rank_dtype
@@ -5536,8 +5544,6 @@ def aten〇linalg_vector_norm〡dtype(self_rank_dtype: Tuple[int, int], ord: Uni
             return aten〇std〡dtype((self_rank, dtype))
         assert not is_complex_dtype(dtype)
         return dtype
-    if self_dtype in [torch.float16, torch.bfloat16]:
-        return torch.float32
     return aten〇std〡dtype(self_rank_dtype)
 
 @check_dtype_function(
@@ -5561,8 +5567,6 @@ def aten〇linalg_norm〡dtype(self_rank_dtype: Tuple[int, int], ord: Optional[U
             return aten〇std〡dtype((self_rank, dtype))
         assert not is_complex_dtype(dtype)
         return dtype
-    if self_dtype in [torch.float16, torch.bfloat16]:
-        return torch.float32
     return aten〇std〡dtype(self_rank_dtype)
 
 def aten〇binary_cross_entropy_with_logits〡dtype(self_rank_dtype: Tuple[int, int], target_rank_dtype: Tuple[int, int], weight_rank_dtype: Optional[Tuple[int, int]] = None, pos_weight_rank_dtype: Optional[Tuple[int, int]] = None, reduction: int = 1) -> int:
@@ -5596,8 +5600,6 @@ def aten〇norm〇Scalar〡dtype(self_rank_dtype: Tuple[int, int], p: Union[int,
     # Should possibly be added to aten〇std〡dtype.
     if self_dtype == torch.complex32:
         return torch.half
-    if self_dtype in [torch.float16, torch.bfloat16]:
-        return torch.float32
     return aten〇std〡dtype(self_rank_dtype)
 
 @check_dtype_function([Invocation(0.0),
