@@ -1988,7 +1988,7 @@ public:
 
     // Overwrite with tm_tensor::attention
     Value attention = AttentionOp::create(rewriter, loc, outType, inputs,
-                                          SmallVector<Value>{output})
+                                          SmallVector<Value>{output}, scaleAttr)
                           .getResult()[0];
 
     if (opTy != outType) {
