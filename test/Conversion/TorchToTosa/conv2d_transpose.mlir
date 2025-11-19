@@ -1,4 +1,3 @@
-// XFAIL: *
 
 // RUN: torch-mlir-opt <%s -convert-torch-to-tosa -split-input-file -verify-diagnostics
 

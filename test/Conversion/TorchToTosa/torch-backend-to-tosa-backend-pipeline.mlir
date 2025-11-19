@@ -1,4 +1,3 @@
-// XFAIL: *
 
 // RUN: torch-mlir-opt -pass-pipeline='builtin.module(torch-backend-to-tosa-backend-pipeline)' -split-input-file -verify-diagnostics %s | FileCheck %s
 
