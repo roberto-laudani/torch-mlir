@@ -7575,18 +7575,11 @@ class DecomposeAtenInstanceNormOp
     Value inputSubMeanSquare = rewriter.create<AtenMulTensorOp>(
         loc, inputTy, inputSubMean, inputSubMean);
 
-    Value variancesum = rewriter.create<AtenSumDimIntListOp>(
-        loc, reducedTy, inputSubMeanSquare, reduceDimList, cstTrue,
-        /*dtype=*/none);
-
-    int64_t elemCount = 1;
-    for (int i = 2; i < inputRank; ++i)
-      elemCount *= inputTy.getSizes()[i];
-
-    Value hw = rewriter.create<Torch::ConstantIntOp>(
-        loc, rewriter.getI64IntegerAttr(elemCount));
-    Value inputVar =
-        rewriter.create<AtenDivScalarOp>(loc, reducedTy, variancesum, hw);
+    // Use AtenMeanDimOp to compute variance, which handles dynamic shapes
+    // correctly by computing the divisor at runtime instead of compile time.
+    // var(x) = mean((x - mean(x))^2)
+    Value inputVar = rewriter.create<AtenMeanDimOp>(
+        loc, reducedTy, inputSubMeanSquare, reduceDimList, cstTrue, none);
 
     // rsqrt(var(x) + eps)
     Value inputVarPlusEps = rewriter.create<AtenAddScalarOp>(
