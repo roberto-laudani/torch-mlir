@@ -5442,28 +5442,35 @@ public:
     if (!resTy || !resTy.hasDtype()) {
       return rewriter.notifyMatchFailure(op, "result should have dtype");
     }
-    if (!selfTy || !selfTy.areAllSizesKnown())
+    if (!selfTy || !selfTy.hasSizes())
+      return rewriter.notifyMatchFailure(op, "self must have known rank");
+    if (!sourceTy || !sourceTy.hasSizes() || !sourceTy.hasDtype())
       return rewriter.notifyMatchFailure(
-          op, "Unimplemented: no implementation for rankless tensor");
-    if (!sourceTy || !sourceTy.areAllSizesKnown() || !sourceTy.hasDtype())
-      return rewriter.notifyMatchFailure(
-          op, "Unimplemented: no implementation for rankless tensor");
+          op, "source must have known rank and dtype");
 
-    int64_t selfNumel = getTensorNumel(self).value(); // as selfTy has sizes
-    int64_t sourceNumel =
-        getTensorNumel(source).value(); // as sourceTy has sizes
     int64_t selfRank = selfTy.getSizes().size();
     int64_t sourceRank = sourceTy.getSizes().size();
 
-    Value constZero = Torch::ConstantIntOp::create(
-        rewriter, loc, rewriter.getI64IntegerAttr(0));
-    Value constOne = Torch::ConstantIntOp::create(
-        rewriter, loc, rewriter.getI64IntegerAttr(1));
-    Value constNone = ConstantNoneOp::create(rewriter, loc);
-    Value selfLastDim = Torch::ConstantIntOp::create(
-        rewriter, loc, rewriter.getI64IntegerAttr(selfRank - 1));
-    Value sourceLastDim = Torch::ConstantIntOp::create(
-        rewriter, loc, rewriter.getI64IntegerAttr(sourceRank - 1));
+    // Compute numel conditionally - use kUnknownSize for dynamic shapes
+    int64_t selfNumel = kUnknownSize;
+    if (selfTy.areAllSizesKnown()) {
+      selfNumel = getTensorNumel(self).value();
+    }
+
+    int64_t sourceNumel = kUnknownSize;
+    if (sourceTy.areAllSizesKnown()) {
+      sourceNumel = getTensorNumel(source).value();
+    }
+
+    Value constZero = rewriter.create<Torch::ConstantIntOp>(
+        loc, rewriter.getI64IntegerAttr(0));
+    Value constOne = rewriter.create<Torch::ConstantIntOp>(
+        loc, rewriter.getI64IntegerAttr(1));
+    Value constNone = rewriter.create<ConstantNoneOp>(loc);
+    Value selfLastDim = rewriter.create<Torch::ConstantIntOp>(
+        loc, rewriter.getI64IntegerAttr(selfRank - 1));
+    Value sourceLastDim = rewriter.create<Torch::ConstantIntOp>(
+        loc, rewriter.getI64IntegerAttr(sourceRank - 1));
 
     auto si64Type = IntegerType::get(context, 64, IntegerType::Signed);
     auto int64Dtype = getDtypeIntValueForType(
@@ -7656,18 +7663,11 @@ class DecomposeAtenInstanceNormOp
     Value inputSubMeanSquare = AtenMulTensorOp::create(
         rewriter, loc, inputTy, inputSubMean, inputSubMean);
 
-    Value variancesum = AtenSumDimIntListOp::create(
-        rewriter, loc, reducedTy, inputSubMeanSquare, reduceDimList, cstTrue,
-        /*dtype=*/none);
-
-    int64_t elemCount = 1;
-    for (int i = 2; i < inputRank; ++i)
-      elemCount *= inputTy.getSizes()[i];
-
-    Value hw = Torch::ConstantIntOp::create(
-        rewriter, loc, rewriter.getI64IntegerAttr(elemCount));
-    Value inputVar =
-        AtenDivScalarOp::create(rewriter, loc, reducedTy, variancesum, hw);
+    // Use AtenMeanDimOp to compute variance, which handles dynamic shapes
+    // correctly by computing the divisor at runtime instead of compile time.
+    // var(x) = mean((x - mean(x))^2)
+    Value inputVar = rewriter.create<AtenMeanDimOp>(
+        loc, reducedTy, inputSubMeanSquare, reduceDimList, cstTrue, none);
 
     // rsqrt(var(x) + eps)
     Value inputVarPlusEps = AtenAddScalarOp::create(rewriter, loc, reducedTy,
