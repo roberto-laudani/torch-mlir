@@ -5396,18 +5396,25 @@ public:
     if (!resTy || !resTy.hasDtype()) {
       return rewriter.notifyMatchFailure(op, "result should have dtype");
     }
-    if (!selfTy || !selfTy.areAllSizesKnown())
+    if (!selfTy || !selfTy.hasSizes())
+      return rewriter.notifyMatchFailure(op, "self must have known rank");
+    if (!sourceTy || !sourceTy.hasSizes() || !sourceTy.hasDtype())
       return rewriter.notifyMatchFailure(
-          op, "Unimplemented: no implementation for rankless tensor");
-    if (!sourceTy || !sourceTy.areAllSizesKnown() || !sourceTy.hasDtype())
-      return rewriter.notifyMatchFailure(
-          op, "Unimplemented: no implementation for rankless tensor");
+          op, "source must have known rank and dtype");
 
-    int64_t selfNumel = getTensorNumel(self).value(); // as selfTy has sizes
-    int64_t sourceNumel =
-        getTensorNumel(source).value(); // as sourceTy has sizes
     int64_t selfRank = selfTy.getSizes().size();
     int64_t sourceRank = sourceTy.getSizes().size();
+
+    // Compute numel conditionally - use kUnknownSize for dynamic shapes
+    int64_t selfNumel = kUnknownSize;
+    if (selfTy.areAllSizesKnown()) {
+      selfNumel = getTensorNumel(self).value();
+    }
+
+    int64_t sourceNumel = kUnknownSize;
+    if (sourceTy.areAllSizesKnown()) {
+      sourceNumel = getTensorNumel(source).value();
+    }
 
     Value constZero = rewriter.create<Torch::ConstantIntOp>(
         loc, rewriter.getI64IntegerAttr(0));

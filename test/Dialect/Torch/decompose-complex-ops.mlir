@@ -940,3 +940,24 @@ func.func @channel_shuffle(%arg0: !torch.vtensor<[1,8,4,4],f32>) -> !torch.vtens
   %0 = torch.aten.channel_shuffle %arg0, %int4 : !torch.vtensor<[1,8,4,4],f32>, !torch.int -> !torch.vtensor<[1,8,4,4],f32>
   return %0 : !torch.vtensor<[1,8,4,4],f32>
 }
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.masked_scatter$dynamic
+// CHECK-DAG: %[[C0:.*]] = torch.constant.int 0
+// CHECK-DAG: %[[C1:.*]] = torch.constant.int 1
+// CHECK-DAG: %[[NONE:.*]] = torch.constant.none
+// CHECK: torch.aten.add.Tensor %arg1, %{{.*}}, %[[C1]] : !torch.vtensor<[?,?],i1>, !torch.vtensor<[?,?],si64>, !torch.int -> !torch.vtensor<[?,?],si64>
+// CHECK: %[[FLAT_MASK:.*]] = torch.aten.view %{{.*}}, %{{.*}} : !torch.vtensor<[?,?],si64>, !torch.list<int> -> !torch.vtensor<[?],si64>
+// CHECK: %[[CUMSUM:.*]] = torch.aten.cumsum %[[FLAT_MASK]], %[[C0]], %[[NONE]] : !torch.vtensor<[?],si64>, !torch.int, !torch.none -> !torch.vtensor<[?],si64>
+// CHECK: %[[SUB:.*]] = torch.aten.sub.Scalar %[[CUMSUM]], %[[C1]], %[[C1]] : !torch.vtensor<[?],si64>, !torch.int, !torch.int -> !torch.vtensor<[?],si64>
+// CHECK: %[[CLAMP:.*]] = torch.aten.clamp %[[SUB]], %[[C0]], %[[NONE]] : !torch.vtensor<[?],si64>, !torch.int, !torch.none -> !torch.vtensor<[?],si64>
+// CHECK: %[[FLAT_SRC:.*]] = torch.aten.view %arg2, %{{.*}} : !torch.vtensor<[?,?],f32>, !torch.list<int> -> !torch.vtensor<[?],f32>
+// CHECK: %[[SELECT:.*]] = torch.aten.index_select %[[FLAT_SRC]], %[[C0]], %[[CLAMP]] : !torch.vtensor<[?],f32>, !torch.int, !torch.vtensor<[?],si64> -> !torch.vtensor<[?],f32>
+// CHECK: %[[VIEW:.*]] = torch.aten.view %[[SELECT]], %{{.*}} : !torch.vtensor<[?],f32>, !torch.list<int> -> !torch.vtensor<[?,?],f32>
+// CHECK: %[[RESULT:.*]] = torch.aten.where.self %arg1, %[[VIEW]], %arg0 : !torch.vtensor<[?,?],i1>, !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],f32> -> !torch.vtensor<[?,?],f32>
+// CHECK: return %[[RESULT]] : !torch.vtensor<[?,?],f32>
+func.func @torch.aten.masked_scatter$dynamic(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.vtensor<[?,?],i1>, %arg2: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?,?],f32> {
+  %0 = torch.aten.masked_scatter %arg0, %arg1, %arg2 : !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],i1>, !torch.vtensor<[?,?],f32> -> !torch.vtensor<[?,?],f32>
+  return %0 : !torch.vtensor<[?,?],f32>
+}
