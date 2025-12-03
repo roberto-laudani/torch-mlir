@@ -679,6 +679,99 @@ def ConvolutionModule2DGroups_basic(module, tu: TestUtils):
     module.forward(tu.rand(1, 32, 4, 4), tu.rand(32, 8, 3, 3))
 
 
+class ConvolutionModule3DGroups(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1, -1, -1], torch.float32, True),
+            ([-1, -1, -1, -1, -1], torch.float32, True),
+        ]
+    )
+    def forward(self, inputVec, weight):
+        return torch.ops.aten.convolution(
+            inputVec,
+            weight,
+            bias=None,
+            stride=[1, 1, 1],
+            padding=[0, 0, 0],
+            dilation=[1, 1, 1],
+            transposed=False,
+            output_padding=[0, 0, 0],
+            groups=2,
+        )
+
+
+@register_test_case(module_factory=lambda: ConvolutionModule3DGroups())
+def ConvolutionModule3DGroups_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 4, 6, 6, 6), tu.rand(8, 2, 3, 3, 3))
+
+
+class ConvolutionModule3DGroupsStrided(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1, -1, -1], torch.float32, True),
+            ([-1, -1, -1, -1, -1], torch.float32, True),
+        ]
+    )
+    def forward(self, inputVec, weight):
+        return torch.ops.aten.convolution(
+            inputVec,
+            weight,
+            bias=None,
+            stride=[2, 2, 2],
+            padding=[1, 1, 1],
+            dilation=[1, 1, 1],
+            transposed=False,
+            output_padding=[0, 0, 0],
+            groups=4,
+        )
+
+
+@register_test_case(module_factory=lambda: ConvolutionModule3DGroupsStrided())
+def ConvolutionModule3DGroupsStrided_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 8, 8, 8, 8), tu.rand(16, 2, 3, 3, 3))
+
+
+class ConvolutionModule3DGroupsDilated(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1, -1, -1], torch.float32, True),
+            ([-1, -1, -1, -1, -1], torch.float32, True),
+        ]
+    )
+    def forward(self, inputVec, weight):
+        return torch.ops.aten.convolution(
+            inputVec,
+            weight,
+            bias=None,
+            stride=[1, 1, 1],
+            padding=[2, 2, 2],
+            dilation=[2, 2, 2],
+            transposed=False,
+            output_padding=[0, 0, 0],
+            groups=2,
+        )
+
+
+@register_test_case(module_factory=lambda: ConvolutionModule3DGroupsDilated())
+def ConvolutionModule3DGroupsDilated_basic(module, tu: TestUtils):
+    module.forward(tu.rand(2, 4, 8, 8, 8), tu.rand(8, 2, 3, 3, 3))
+
+
 # ==============================================================================
 
 
@@ -1086,6 +1179,94 @@ class UpSampleNearest2dSameFactor(torch.nn.Module):
 @register_test_case(module_factory=lambda: UpSampleNearest2dSameFactor())
 def UpSampleNearest2dStaticFactor_basic(module, tu: TestUtils):
     module.forward(tu.rand(2, 3, 4, 4))
+
+
+class UpSampleNearest2dVecNoneShape(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1, -1], torch.float64, True),
+        ]
+    )
+    def forward(self, input):
+        return torch.ops.aten.upsample_nearest2d.vec(
+            input, output_size=None, scale_factors=[3.66, 4.2]
+        )
+
+
+@register_test_case(module_factory=lambda: UpSampleNearest2dVecNoneShape())
+def UpSampleNearest2dVecNoneShape_basic(module, tu: TestUtils):
+    module.forward(tu.rand(1, 1, 6, 12).to(torch.float64))
+
+
+class UpSampleNearest2dVecNoneScales(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1, -1], torch.float64, True),
+        ]
+    )
+    def forward(self, input):
+        return torch.ops.aten.upsample_nearest2d.vec(
+            input,
+            output_size=[18, 48],
+            scale_factors=None,
+        )
+
+
+@register_test_case(module_factory=lambda: UpSampleNearest2dVecNoneScales())
+def UpSampleNearest2dVecNoneScales_basic(module, tu: TestUtils):
+    module.forward(tu.rand(1, 1, 6, 12).to(torch.float64))
+
+
+class UpSampleNearest1dVecNoneShape(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1], torch.float64, True),
+        ]
+    )
+    def forward(self, input):
+        return torch.ops.aten.upsample_nearest1d.vec(
+            input, output_size=None, scale_factors=[3.0]
+        )
+
+
+@register_test_case(module_factory=lambda: UpSampleNearest1dVecNoneShape())
+def UpSampleNearest1dVecNoneShape_basic(module, tu: TestUtils):
+    module.forward(tu.rand(1, 1, 6).to(torch.float64))
+
+
+class UpSampleNearest1dVecNoneScales(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @export
+    @annotate_args(
+        [
+            None,
+            ([-1, -1, -1], torch.float64, True),
+        ]
+    )
+    def forward(self, input):
+        return torch.ops.aten.upsample_nearest1d.vec(input, [18], None)
+
+
+@register_test_case(module_factory=lambda: UpSampleNearest1dVecNoneScales())
+def UpSampleNearest1dVecNoneScales_basic(module, tu: TestUtils):
+    module.forward(tu.rand(1, 1, 6).to(torch.float64))
 
 
 class Conv1dModule(torch.nn.Module):
