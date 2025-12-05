@@ -23,12 +23,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
-
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Pass/Pass.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
@@ -39,6 +38,11 @@
 using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::Torch;
+namespace mlir::torch::Torch {
+
+#define GEN_PASS_DEF_FLATSYMBOLREFLATTICEANCHOR
+#define GEN_PASS_DEF_INLINEGLOBALSLOTS
+#include "torch-mlir/Dialect/Torch/Transforms/Passes.h.inc"
 
 /// A program point representing a symbol.
 ///
@@ -277,7 +281,7 @@ static bool isInitialValueTransitivelySafeToInline(Value initialValue,
 
 namespace {
 class InlineGlobalSlotsPass
-    : public InlineGlobalSlotsBase<InlineGlobalSlotsPass> {
+    : public impl::InlineGlobalSlotsBase<InlineGlobalSlotsPass> {
   void runOnOperation() override {
 
     ModuleOp module = getOperation();
@@ -418,7 +422,8 @@ class InlineGlobalSlotsPass
 };
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>>
-mlir::torch::Torch::createInlineGlobalSlotsPass() {
+std::unique_ptr<OperationPass<ModuleOp>> createInlineGlobalSlotsPass() {
   return std::make_unique<InlineGlobalSlotsPass>();
 }
+
+} // namespace mlir::torch::Torch
