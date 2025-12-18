@@ -2,8 +2,8 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
 load("@com_github_bazelbuild_buildtools//buildifier:def.bzl", "buildifier")
+load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
 
 package(
     default_visibility = [
@@ -376,7 +376,9 @@ cc_library(
         "lib/Conversion/TorchToLinalg/*.cpp",
         "lib/Conversion/TorchToLinalg/*.h",
     ]),
-    hdrs = glob(["include/torch-mlir/Conversion/TorchToLinalg/*.h"]),
+    hdrs = glob(["include/torch-mlir/Conversion/TorchToLinalg/*.h"]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionPassesIncGen",
@@ -400,7 +402,9 @@ cc_library(
         "lib/Conversion/*.h",
         "lib/Conversion/TorchToSCF/*.cpp",
     ]),
-    hdrs = glob(["include/torch-mlir/Conversion/TorchToSCF/*.h"]),
+    hdrs = glob(["include/torch-mlir/Conversion/TorchToSCF/*.h"]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionPassesIncGen",
@@ -424,7 +428,9 @@ cc_library(
     ]),
     hdrs = glob([
         "include/torch-mlir/Conversion/TorchToArith/*.h",
-    ]),
+    ]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionPassesIncGen",
@@ -443,7 +449,9 @@ cc_library(
     ]),
     hdrs = glob([
         "include/torch-mlir/Conversion/TorchToTensor/*.h",
-    ]),
+    ]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionPassesIncGen",
@@ -466,7 +474,9 @@ cc_library(
     ]),
     hdrs = glob([
         "include/torch-mlir/Conversion/TorchConversionToMLProgram/*.h",
-    ]),
+    ]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionPassesIncGen",
@@ -485,7 +495,9 @@ cc_library(
         "lib/Conversion/*.h",
         "lib/Conversion/TorchToTMTensor/*.cpp",
     ]),
-    hdrs = glob(["include/torch-mlir/Conversion/TorchToTMTensor/*.h"]),
+    hdrs = glob(["include/torch-mlir/Conversion/TorchToTMTensor/*.h"]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionPassesIncGen",
@@ -504,7 +516,9 @@ cc_library(
         "lib/Conversion/TorchToStablehlo/*.h",
         "lib/Conversion/TorchToStablehlo/*.cpp",
     ]),
-    hdrs = glob(["include/torch-mlir/Conversion/TorchToStablehlo/*.h"]),
+    hdrs = glob(["include/torch-mlir/Conversion/TorchToStablehlo/*.h"]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     defines = [
         "TORCH_MLIR_ENABLE_STABLEHLO",
     ],
@@ -558,7 +572,7 @@ cc_library(
         ":TorchMLIRTorchToStablehlo",
         ":TorchMLIRTorchToTMTensor",
         ":TorchMLIRTorchToTensor",
-#       ":TorchMLIRTorchToTosa",
+        #       ":TorchMLIRTorchToTosa",
     ],
 )
 
@@ -587,7 +601,7 @@ cc_library(
         ":TorchMLIRTorchToStablehlo",
         ":TorchMLIRTorchToTMTensor",
         ":TorchMLIRTorchToTensor",
-#       ":TorchMLIRTorchToTosa",
+        #       ":TorchMLIRTorchToTosa",
         "@llvm-project//mlir:ConversionPasses",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:LinalgDialect",
@@ -605,7 +619,9 @@ cc_library(
         "lib/Conversion/*.h",
         "lib/Conversion/TorchToTosa/*.cpp",
     ]),
-    hdrs = glob(["include/torch-mlir/Conversion/TorchToTosa/*.h"]),
+    hdrs = glob(["include/torch-mlir/Conversion/TorchToTosa/*.h"]) + [
+        "include/torch-mlir/Conversion/Passes.h",
+    ],
     defines = [
         #"TORCH_MLIR_ENABLE_TOSA",
     ],
