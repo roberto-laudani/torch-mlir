@@ -35,6 +35,36 @@ func.func @torch.aten.permute$rank0(%arg0: !torch.vtensor<[],f32>) -> !torch.vte
 
 // -----
 
+// CHECK-LABEL: func.func @torch.aten.transpose
+// CHECK:         tensor.empty({{.*}}) : tensor<1x192x?x640xf32>
+// CHECK:         linalg.transpose ins({{.*}} : tensor<?x192x1x640xf32>) outs({{.*}} : tensor<1x192x?x640xf32>) permutation = [2, 1, 0, 3]
+func.func @torch.aten.transpose(%arg0: !torch.vtensor<[?, 192, 1, 640],f32>) -> !torch.vtensor<[1, 192, ?, 640],f32> {
+  %int0 = torch.constant.int 0
+  %int2 = torch.constant.int 2
+  %0 = torch.aten.transpose.int %arg0, %int0, %int2 : !torch.vtensor<[?,192,1,640],f32>, !torch.int, !torch.int -> !torch.vtensor<[1, 192, ?, 640],f32>
+  return %0 : !torch.vtensor<[1, 192, ?, 640],f32>
+}
+
+// -----
+
+// This test exercises dynamic->static type refinement. The input has dynamic dim0,
+// but the output type is more static (dim2 = 1 after swap). The lowering inserts a
+// cast on the transpose result, which canonicalization then optimizes to cast the input.
+// (Type refinement can occur due to shape analysis/assertions in the broader context.)
+// CHECK-LABEL: func.func @torch.aten.transpose$with_cast
+// CHECK:         %[[INPUT:.*]] = torch_c.to_builtin_tensor
+// CHECK:         tensor.empty({{.*}}) : tensor<3x192x1x640xf32>
+// CHECK:         tensor.cast %[[INPUT]] : tensor<?x192x3x640xf32> to tensor<1x192x3x640xf32>
+// CHECK:         linalg.transpose ins({{.*}} : tensor<1x192x3x640xf32>) outs({{.*}} : tensor<3x192x1x640xf32>) permutation = [2, 1, 0, 3]
+func.func @torch.aten.transpose$with_cast(%arg0: !torch.vtensor<[?, 192, 3, 640],f32>) -> !torch.vtensor<[3, 192, 1, 640],f32> {
+  %int0 = torch.constant.int 0
+  %int2 = torch.constant.int 2
+  %0 = torch.aten.transpose.int %arg0, %int0, %int2 : !torch.vtensor<[?, 192, 3, 640],f32>, !torch.int, !torch.int -> !torch.vtensor<[3, 192, 1, 640],f32>
+  return %0 : !torch.vtensor<[3, 192, 1, 640],f32>
+}
+
+// -----
+
 // CHECK: #[[$INPUT_MAP:.+]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 // CHECK-LABEL:   func.func @torch.aten.reflection_pad2d(
 // CHECK-SAME:                                           %[[VAL_0:.*]]: !torch.vtensor<[1,1,4,4],f32>) -> !torch.vtensor<[1,1,8,9],f32> {

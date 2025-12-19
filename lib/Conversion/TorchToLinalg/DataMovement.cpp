@@ -1732,23 +1732,37 @@ public:
 
     auto loc = op.getLoc();
 
-    SmallVector<Value> outputDims;
-    for (auto i = 0; i < inputRank; i++)
-      outputDims.push_back(getDimOp(rewriter, loc, adaptor.getSelf(), i));
-    std::swap(outputDims[dim0], outputDims[dim1]);
-
-    Value outVector = tensor::EmptyOp::create(
-        rewriter, loc, getAsOpFoldResult(outputDims), elementType);
-
     SmallVector<int64_t> permutation(inputRank);
     std::iota(permutation.begin(), permutation.end(), 0);
-    permutation[dim0] = dim1;
-    permutation[dim1] = dim0;
+    std::swap(permutation[dim0], permutation[dim1]);
+
+    // Build init type from permuted input shape, preserving dynamic dims
+    SmallVector<int64_t> initShape(inputRank);
+    SmallVector<Value> dynamicDims;
+    for (auto i = 0; i < inputRank; i++) {
+      int64_t inputDim = inType.getShape()[permutation[i]];
+      if (ShapedType::isDynamic(inputDim)) {
+        initShape[i] = ShapedType::kDynamic;
+        dynamicDims.push_back(
+            getDimOp(rewriter, loc, adaptor.getSelf(), permutation[i]));
+      } else {
+        initShape[i] = inputDim;
+      }
+    }
+    auto initType = RankedTensorType::get(initShape, elementType);
+
+    Value outVector =
+        tensor::EmptyOp::create(rewriter, loc, initType, dynamicDims);
 
     auto transpose = linalg::TransposeOp::create(rewriter, loc, inVector,
-                                                 outVector, permutation)
-                         .getResult();
-    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, outType, transpose);
+                                                 outVector, permutation);
+    Value result = transpose.getResult().front();
+
+    // Only insert tensor.cast when transpose doesn't already have the converted
+    // result type
+    if (result.getType() != outType)
+      result = tensor::CastOp::create(rewriter, loc, outType, result);
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
