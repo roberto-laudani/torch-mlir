@@ -129,7 +129,8 @@ func.func @test_rotary_embedding_3d_dynamic(%arg0: !torch.vtensor<[?,?,24],f32>,
 
   // COM: Expand to 4D with num_heads determined from the cos/sin cache shapes.
   // CHECK:     %[[EXPANDED:.*]] = tensor.expand_shape %[[X3D_T]] {{\[\[}}0], [1], [2, 3]] output_shape [%{{.*}}, %{{.*}}, 4, 6] : tensor<?x?x24xf32> into tensor<?x?x4x6xf32>
-  // CHECK:     %[[RESHAPED4D:.*]] = tensor.reshape %[[EXPANDED]](%{{.*}}) : (tensor<?x?x4x6xf32>, tensor<4xindex>) -> tensor<?x4x?x6xf32>
+  // CHECK:     %[[TRANSPOSE_INIT:.*]] = tensor.empty(%{{.*}}, %{{.*}}) : tensor<?x4x?x6xf32>
+  // CHECK:     %[[RESHAPED4D:.*]] = linalg.transpose ins(%[[EXPANDED]] : tensor<?x?x4x6xf32>) outs(%[[TRANSPOSE_INIT]] : tensor<?x4x?x6xf32>) permutation = [0, 2, 1, 3]
 
   // CHECK:     %[[INIT3D:.*]] = tensor.empty(
   // CHECK:     %[[ZERO3D:.*]] = arith.constant 0.000000e+00 : f32
@@ -166,8 +167,8 @@ func.func @test_rotary_embedding_3d_dynamic(%arg0: !torch.vtensor<[?,?,24],f32>,
 
   // COM: Restore the original 3D shape.
   // CHECK:     %[[CAST3:.*]] = tensor.cast %[[GENERIC_3D]] : tensor<?x?x?x?xf32> to tensor<?x4x?x6xf32>
-  // CHECK:     %[[RESHAPE_BACK_SRC_DIMS:.*]] = tensor.from_elements %{{.*}} : tensor<4xindex>
-  // CHECK:     %[[RESHAPE_BACK:.*]] = tensor.reshape %[[CAST3]](%[[RESHAPE_BACK_SRC_DIMS]]) : (tensor<?x4x?x6xf32>, tensor<4xindex>) -> tensor<?x?x4x6xf32>
+  // CHECK:     %[[TRANSPOSE_INIT2:.*]] = tensor.empty(%{{.*}}, %{{.*}}) : tensor<?x?x4x6xf32>
+  // CHECK:     %[[RESHAPE_BACK:.*]] = linalg.transpose ins(%[[CAST3]] : tensor<?x4x?x6xf32>) outs(%[[TRANSPOSE_INIT2]] : tensor<?x?x4x6xf32>) permutation = [0, 2, 1, 3]
   // CHECK:     %[[COLLAPSED3:.*]] = tensor.collapse_shape %[[RESHAPE_BACK]] {{\[\[}}0], [1], [2, 3]] : tensor<?x?x4x6xf32> into tensor<?x?x24xf32>
   // CHECK:     %[[RET3_VT:.*]] = torch_c.from_builtin_tensor %[[COLLAPSED3]] : tensor<?x?x24xf32> -> !torch.vtensor<[?,?,24],f32>
   // CHECK:     return %[[RET3_VT]] : !torch.vtensor<[?,?,24],f32>

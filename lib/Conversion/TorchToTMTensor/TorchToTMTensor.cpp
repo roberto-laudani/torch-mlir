@@ -1826,7 +1826,22 @@ public:
       mask =
           linalg::FillOp::create(rewriter, loc, zero, emptyMask).getResult(0);
 
-      int64_t rank = cast<ShapedType>(queryTy).getRank();
+      // Use lower-right aligned causal mask to correctly handle KV cache
+      // scenarios where Q_len < K_len (decode with past states).
+      // Standard (upper-left) mask uses: i >= j
+      // Lower-right aligned uses: (i + offset) >= j, where offset = K_len - Q_len
+
+      // Mask tensor has shape [batch, heads, Q_len, K_len]
+      // Q_len is at rank-2, K_len is at rank-1
+      auto maskTy = cast<ShapedType>(mask.getType());
+      int64_t maskQDim = maskTy.getRank() - 2;
+      int64_t maskKDim = maskTy.getRank() - 1;
+
+      Value qLen = tensor::DimOp::create(rewriter, loc, mask, maskQDim);
+      Value kLen = tensor::DimOp::create(rewriter, loc, mask, maskKDim);
+      Value offset = arith::SubIOp::create(rewriter, loc, kLen, qLen);
+
+      int64_t rank = maskTy.getRank();
       AffineMap maskMap = rewriter.getMultiDimIdentityMap(rank);
       SmallVector<utils::IteratorType> iteratorTypes(
           rank, utils::IteratorType::parallel);
@@ -1834,11 +1849,13 @@ public:
           rewriter, loc, mask.getType(), ValueRange{}, mask,
           SmallVector<AffineMap>{maskMap}, iteratorTypes,
           [&](OpBuilder &b, Location loc, ValueRange args) {
-            Value i = linalg::IndexOp::create(b, loc, queryTy.getRank() - 2);
-            Value j = linalg::IndexOp::create(b, loc, queryTy.getRank() - 1);
+            Value i = linalg::IndexOp::create(b, loc, maskQDim);
+            Value j = linalg::IndexOp::create(b, loc, maskKDim);
 
-            Value cond =
-                arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge, i, j);
+            // Lower-right alignment: (i + offset) >= j
+            Value adjustedI = arith::AddIOp::create(b, loc, i, offset);
+            Value cond = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge,
+                                               adjustedI, j);
             Value select = arith::SelectOp::create(b, loc, cond, zero, negInf);
             linalg::YieldOp::create(b, loc, select);
           });

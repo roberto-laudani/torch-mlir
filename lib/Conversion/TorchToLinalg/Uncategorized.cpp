@@ -3642,6 +3642,30 @@ public:
 };
 } // namespace
 
+/// Build a transposed tensor using linalg::TransposeOp.
+/// Creates the empty tensor with proper dynamic dimension handling and
+/// returns the transposed result.
+static Value buildTranspose(OpBuilder &rewriter, Location loc,
+                            Value sourceTensor,
+                            ArrayRef<int64_t> transposedIndices,
+                            ArrayRef<int64_t> transposedShape, Type elementType) {
+  SmallVector<OpFoldResult> transposedDims;
+  for (size_t i = 0; i < transposedIndices.size(); ++i) {
+    if (ShapedType::isDynamic(transposedShape[i])) {
+      Value dimVal = tensor::DimOp::create(rewriter, loc, sourceTensor,
+                                           transposedIndices[i]);
+      transposedDims.push_back(dimVal);
+    } else {
+      transposedDims.push_back(rewriter.getIndexAttr(transposedShape[i]));
+    }
+  }
+  Value emptyTensor =
+      tensor::EmptyOp::create(rewriter, loc, transposedDims, elementType);
+  return linalg::TransposeOp::create(rewriter, loc, sourceTensor, emptyTensor,
+                                     transposedIndices)
+      ->getResult(0);
+}
+
 namespace {
 class ConvertOnnxVariantRotaryEmbeddingOp
     : public OpConversionPattern<OnnxVariantRotaryEmbeddingOp> {
@@ -3868,19 +3892,14 @@ private:
           loc, expandedType, input, reassociation);
       SmallVector<int64_t> transposedIndices{0, 2, 1, 3};
       SmallVector<int64_t> transposedShape(4);
-      SmallVector<Value, 4> transposeOperands;
       for (int i = 0; i < 4; ++i) {
-        int transposedIdx = transposedIndices[i];
-        transposedShape[i] = expandedShape[transposedIdx];
-        transposeOperands.push_back(
-            rewriter.create<tensor::DimOp>(loc, expandedInput, transposedIdx));
+        transposedShape[i] = expandedShape[transposedIndices[i]];
       }
-      Value transposedIndicesVal =
-          rewriter.create<tensor::FromElementsOp>(loc, transposeOperands);
       preprocessedInputType =
           RankedTensorType::get(transposedShape, inputType.getElementType());
-      preprocessedInput = rewriter.create<tensor::ReshapeOp>(
-          loc, preprocessedInputType, expandedInput, transposedIndicesVal);
+      preprocessedInput = buildTranspose(rewriter, loc, expandedInput,
+                                         transposedIndices, transposedShape,
+                                         inputType.getElementType());
     }
 
     rotaryEmbeddingDim = parameters.rotaryEmbeddingDim;
@@ -4011,19 +4030,12 @@ private:
     SmallVector<int64_t> nonTransposedShape(preprocessedInputType.getShape());
     SmallVector<int64_t> transposedIndices{0, 2, 1, 3};
     SmallVector<int64_t> transposedShape(4);
-    SmallVector<Value, 4> transposeOperands;
     for (int i = 0; i < 4; ++i) {
-      int transposedIdx = transposedIndices[i];
-      transposedShape[i] = nonTransposedShape[transposedIdx];
-      transposeOperands.push_back(rewriter.create<tensor::DimOp>(
-          loc, nonTransposedResult, transposedIdx));
+      transposedShape[i] = nonTransposedShape[transposedIndices[i]];
     }
-    Value transposedIndicesVal =
-        rewriter.create<tensor::FromElementsOp>(loc, transposeOperands);
-    auto nonCollapsedOutputType =
-        RankedTensorType::get(transposedShape, resultType.getElementType());
-    Value transposedResult = rewriter.create<tensor::ReshapeOp>(
-        loc, nonCollapsedOutputType, nonTransposedResult, transposedIndicesVal);
+    Value transposedResult =
+        buildTranspose(rewriter, loc, nonTransposedResult, transposedIndices,
+                       transposedShape, resultType.getElementType());
     SmallVector<ReassociationIndices> reassociation{{0}, {1}, {2, 3}};
     rewriter.replaceOpWithNewOp<tensor::CollapseShapeOp>(
         op, resultType, transposedResult, reassociation);

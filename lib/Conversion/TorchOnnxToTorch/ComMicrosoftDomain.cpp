@@ -17,6 +17,76 @@ using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::onnx_c;
 
+namespace {
+/// Result struct for decomposed RMS normalization
+struct RMSNormResult {
+  Value output;    // normalized * scale
+  Value meanSq;    // mean(x²) - intermediate
+  Value invStdVar; // rsqrt(mean(x²) + eps) - intermediate
+};
+
+/// Build decomposed RMS normalization ops.
+/// Returns the output and intermediates (meanSq, invStdVar) for optional
+/// outputs. RMS norm formula: y = x * rsqrt(mean(x²) + eps) * scale
+static RMSNormResult buildRMSNorm(OpBinder &binder,
+                                  ConversionPatternRewriter &rewriter,
+                                  Value input, Value scale, Value epsilon,
+                                  int64_t axis, Type outputType) {
+  Location loc = binder.getLoc();
+  auto inputTy = cast<Torch::ValueTensorType>(input.getType());
+  ArrayRef<int64_t> inputShape = inputTy.getSizes();
+  int64_t rank = inputShape.size();
+
+  // Build reduce dims list [axis, axis+1, ..., rank-1]
+  auto context = binder.op->getContext();
+  auto sizeListType = Torch::ListType::get(Torch::IntType::get(context));
+  SmallVector<Value> reduceDimVals;
+  for (int64_t i = axis; i < rank; i++) {
+    reduceDimVals.push_back(Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(i)));
+  }
+  Value reduceDimList = Torch::PrimListConstructOp::create(
+      rewriter, loc, sizeListType, reduceDimVals);
+
+  // Compute reduced shape for meanSq/invStdVar (keepdim=true)
+  SmallVector<int64_t> reducedShape(inputShape.begin(), inputShape.end());
+  for (int64_t i = axis; i < rank; i++)
+    reducedShape[i] = 1;
+  auto reducedType =
+      Torch::ValueTensorType::get(context, reducedShape, inputTy.getDtype());
+
+  // x²
+  Value xSquared =
+      Torch::AtenMulTensorOp::create(rewriter, loc, inputTy, input, input);
+
+  // mean(x²) with keepdim=true
+  Value cstTrue = Torch::ConstantBoolOp::create(rewriter, loc, true);
+  Value none = Torch::ConstantNoneOp::create(rewriter, loc);
+  Value meanSq = Torch::AtenMeanDimOp::create(
+      rewriter, loc, reducedType, xSquared, reduceDimList, cstTrue, none);
+
+  // mean(x²) + eps
+  Value one = Torch::ConstantIntOp::create(rewriter, loc,
+                                           rewriter.getI64IntegerAttr(1));
+  Value meanPlusEps = Torch::AtenAddScalarOp::create(rewriter, loc, reducedType,
+                                                     meanSq, epsilon, one);
+
+  // inv_std_var = rsqrt(mean(x²) + eps)
+  Value invStdVar =
+      Torch::AtenRsqrtOp::create(rewriter, loc, reducedType, meanPlusEps);
+
+  // x * inv_std_var
+  Value normalized =
+      Torch::AtenMulTensorOp::create(rewriter, loc, inputTy, input, invStdVar);
+
+  // normalized * scale
+  Value output = Torch::AtenMulTensorOp::create(rewriter, loc, outputType,
+                                                normalized, scale);
+
+  return {output, meanSq, invStdVar};
+}
+} // namespace
+
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
     OnnxCustomOpConversionPattern &patterns) {
   patterns.onOp(
@@ -24,60 +94,40 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Torch::ValueTensorType yType;
         Value x, scale;
-        int64_t axis, stashType;
+        int64_t axis;
         float epsilon;
         if (binder.tensorOperandAtIndex(x, 0) ||
             binder.tensorOperandAtIndex(scale, 1) ||
             binder.tensorResultTypeAtIndex(yType, 0) ||
             binder.s64IntegerAttr(axis, "axis", -1) ||
-            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f) ||
-            binder.s64IntegerAttr(stashType, "stash_type", 1))
+            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f))
           return failure();
 
-        std::optional<int64_t> stashTypeIntTorch =
-            onnxDtypeIntToTorchDtypeInt(stashType);
-        if (!stashTypeIntTorch.has_value())
-          return rewriter.notifyMatchFailure(
-              binder.op, "unimplemented support for the given stash_type");
-        FailureOr<Type> stashDtype = Torch::getTypeForScalarType(
-            binder.op->getContext(),
-            (torch_upstream::ScalarType)stashTypeIntTorch.value());
-        if (failed(stashDtype))
-          return failure();
+        auto xType = dyn_cast<Torch::ValueTensorType>(x.getType());
+        if (!xType || !xType.hasSizes())
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "Expected input to have sizes");
 
-        // Build native layer norm with bias=None, as per the simplified
-        // signature.
-        Value biasNone =
-            rewriter.create<Torch::ConstantNoneOp>(binder.getLoc());
-        Value y, mean, rstd;
-        if (failed(buildNativeLayerNormOp(binder, rewriter, x, scale, biasNone,
-                                          yType, /*stashDtype=*/*stashDtype,
-                                          axis, epsilon, y, mean, rstd)))
-          return failure();
+        ArrayRef<int64_t> xShape = xType.getSizes();
+        int64_t rank = static_cast<int64_t>(xShape.size());
+        int64_t axisNorm = Torch::toPositiveDim(axis, rank);
 
-        // Prepare final result list based on requested result types.
+        // Build epsilon constant
+        Value constEpsilon = Torch::ConstantFloatOp::create(
+            rewriter, binder.getLoc(), rewriter.getType<Torch::FloatType>(),
+            rewriter.getF64FloatAttr(epsilon));
+
+        // Use decomposed RMS norm to get intermediates
+        RMSNormResult rmsResult = buildRMSNorm(binder, rewriter, x, scale,
+                                               constEpsilon, axisNorm, yType);
+
+        // Build results
         SmallVector<Value> results;
-        results.push_back(y);
+        results.push_back(rmsResult.output);
 
-        int64_t numResults = binder.op->getNumResults();
-        auto pushOptionalResult = [&](int idx, Value &val) {
-          if (numResults <= idx)
-            return;
-          Type resTy = binder.op->getResult(idx).getType();
-          if (isa<Torch::NoneType>(resTy)) {
-            results.push_back(
-                rewriter.create<Torch::ConstantNoneOp>(binder.getLoc()));
-            return;
-          }
-          auto desiredTy = cast<Torch::ValueTensorType>(resTy);
-          auto curTy = cast<Torch::ValueTensorType>(val.getType());
-          if (desiredTy.getOptionalDtype() != curTy.getOptionalDtype())
-            val = Torch::convertTensorToDtype(rewriter, binder.getLoc(), val,
-                                              desiredTy.getDtype());
-          results.push_back(val);
-        };
-        pushOptionalResult(1, mean);
-        pushOptionalResult(2, rstd);
+        // Output 1: inv_std_var (only if requested)
+        if (binder.op->getNumResults() > 1)
+          results.push_back(rmsResult.invStdVar);
 
         rewriter.replaceOp(binder.op, results);
         return success();
@@ -97,55 +147,51 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
 
         // Optional bias at operand 3.
         Value bias;
-        if (binder.tensorOperandAtIndex(bias, 3))
-          bias = rewriter.create<Torch::ConstantNoneOp>(binder.getLoc());
+        if (failed(binder.tensorOperandAtIndex(bias, 3)))
+          bias = Torch::ConstantNoneOp::create(rewriter, binder.getLoc());
 
-        // axis = last dimension (use -1 and rely on helper normalization)
-        Value y, mean, rstd;
-        if (failed(buildNativeLayerNormOp(binder, rewriter, x, scale, bias,
-                                          yType,
-                                          /*stashDtype=*/std::nullopt,
-                                          /*axis=*/-1, epsilon, y, mean, rstd)))
-          return failure();
+        // First compute x + skip (+ bias if present) - this is what gets
+        // normalized
+        Value alpha = Torch::ConstantFloatOp::create(
+            rewriter, binder.getLoc(), rewriter.getF64FloatAttr(1.0));
+        Value inputSkipBiasSum = Torch::AtenAddTensorOp::create(
+            rewriter, binder.getLoc(), yType, x, skip, alpha);
+        if (!isa<Torch::NoneType>(bias.getType()))
+          inputSkipBiasSum = Torch::AtenAddTensorOp::create(
+              rewriter, binder.getLoc(), yType, inputSkipBiasSum, bias, alpha);
 
+        auto inputType =
+            dyn_cast<Torch::ValueTensorType>(inputSkipBiasSum.getType());
+        if (!inputType || !inputType.hasSizes())
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "Expected input to have sizes");
+
+        ArrayRef<int64_t> inputShape = inputType.getSizes();
+        int64_t rank = static_cast<int64_t>(inputShape.size());
+
+        // Build epsilon constant
+        Value constEpsilon = Torch::ConstantFloatOp::create(
+            rewriter, binder.getLoc(), rewriter.getType<Torch::FloatType>(),
+            rewriter.getF64FloatAttr(epsilon));
+
+        // Use decomposed RMS norm to get intermediates
+        // Normalize over the last dimension (axis = rank - 1)
+        int64_t axis = rank - 1;
+        RMSNormResult rmsResult =
+            buildRMSNorm(binder, rewriter, inputSkipBiasSum, scale,
+                         constEpsilon, axis, yType);
+
+        // Build results based on number of declared outputs
         SmallVector<Value> results;
-        results.push_back(y);
-
         int64_t numResults = binder.op->getNumResults();
-        auto pushOptionalResultNoCast = [&](int idx, Value &val) {
-          if (numResults <= idx)
-            return;
-          Type resTy = binder.op->getResult(idx).getType();
-          if (isa<Torch::NoneType>(resTy))
-            results.push_back(
-                rewriter.create<Torch::ConstantNoneOp>(binder.getLoc()));
-          else
-            results.push_back(val);
-        };
-        pushOptionalResultNoCast(1, mean);
-        pushOptionalResultNoCast(2, rstd);
 
-        if (numResults == 4) {
-          // Validate/derive skip result type at index 3 when present.
-          Type res3Ty = binder.op->getResult(3).getType();
-          auto skipType = dyn_cast<Torch::ValueTensorType>(res3Ty);
-          if (!skipType && !isa<Torch::NoneType>(res3Ty))
-            return failure();
-          Value alpha = rewriter.create<Torch::ConstantFloatOp>(
-              binder.getLoc(), rewriter.getF64FloatAttr(1.0));
-          if (isa<Torch::NoneType>(res3Ty)) {
-            results.push_back(
-                rewriter.create<Torch::ConstantNoneOp>(binder.getLoc()));
-          } else {
-            Value inputSkipBiasSum = rewriter.create<Torch::AtenAddTensorOp>(
-                binder.getLoc(), skipType ? skipType : yType, x, skip, alpha);
-            if (!isa<Torch::NoneType>(bias.getType()))
-              inputSkipBiasSum = rewriter.create<Torch::AtenAddTensorOp>(
-                  binder.getLoc(), skipType ? skipType : yType,
-                  inputSkipBiasSum, bias, alpha);
-            results.push_back(inputSkipBiasSum);
-          }
-        }
+        results.push_back(rmsResult.output); // output 0: normalized
+        if (numResults > 1)
+          results.push_back(rmsResult.meanSq); // output 1: mean(x²)
+        if (numResults > 2)
+          results.push_back(rmsResult.invStdVar); // output 2: inv_std_var
+        if (numResults > 3)
+          results.push_back(inputSkipBiasSum); // output 3: input_skip_bias_sum
 
         rewriter.replaceOp(binder.op, results);
         return success();
@@ -247,7 +293,7 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
           scaledMatmul = rewriter.create<Torch::AtenMulScalarOp>(
               loc, resultType, matmulFloat, scaleProduct);
         // TODO: Check bias type constraints as well...
-        if (binder.tensorOperandAtIndex(bias, 6))
+        if (failed(binder.tensorOperandAtIndex(bias, 6)))
           rewriter.replaceOp(binder.op, scaledMatmul);
         else {
           Value alphaFP = rewriter.create<Torch::ConstantFloatOp>(
@@ -426,11 +472,18 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         int64_t hiddenSize = queryDims[2];
         int64_t headSize = hiddenSize / numHeads;
 
-        Value cstBatchSize = Torch::ConstantIntOp::create(
-            rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(batchSize));
-        Value cstSequenceLength = Torch::ConstantIntOp::create(
-            rewriter, binder.getLoc(),
-            rewriter.getI64IntegerAttr(sequenceLength));
+        // For dynamic batch/sequence dimensions, use AtenSizeIntOp to get
+        // runtime values instead of using -1 (kDynamic) as a constant.
+        Value cstDim0 = Torch::ConstantIntOp::create(
+            rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(0));
+        Value cstDim1 = Torch::ConstantIntOp::create(
+            rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(1));
+        Value cstBatchSize = Torch::AtenSizeIntOp::create(
+            rewriter, binder.getLoc(), rewriter.getType<Torch::IntType>(),
+            query, cstDim0);
+        Value cstSequenceLength = Torch::AtenSizeIntOp::create(
+            rewriter, binder.getLoc(), rewriter.getType<Torch::IntType>(),
+            query, cstDim1);
         Value cstHiddenSize = Torch::ConstantIntOp::create(
             rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(hiddenSize));
         Value cstHeadSize = Torch::ConstantIntOp::create(
@@ -448,47 +501,75 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         // Value: (batch_size, kv_sequence_length, kv_hidden_size)
         //     -> (batch_size, kv_num_heads, sequence_length, head_size)
 
-        // Reshaping query.
-        SmallVector<int64_t> queryReshapeSizesInt{batchSize, numHeads,
-                                                  sequenceLength, headSize};
+        // Reshaping query from [batch, seq, hidden] to [batch, heads, seq,
+        // head_dim]. First reshape to [batch, seq, heads, head_dim] (preserves
+        // data layout), then transpose to [batch, heads, seq, head_dim].
+        SmallVector<int64_t> queryReshapeSizesInt{batchSize, sequenceLength,
+                                                  numHeads, headSize};
         Value queryReshapeSizesList = Torch::PrimListConstructOp::create(
             rewriter, binder.getLoc(),
             Torch::ListType::get(Torch::IntType::get(query.getContext())),
-            llvm::SmallVector<Value>{cstBatchSize, cstNumHeads,
-                                     cstSequenceLength, cstHeadSize});
-        Value qInput = Torch::AtenReshapeOp::create(
+            llvm::SmallVector<Value>{cstBatchSize, cstSequenceLength,
+                                     cstNumHeads, cstHeadSize});
+        Value qReshaped = Torch::AtenReshapeOp::create(
             rewriter, loc,
             queryType.getWithSizesAndDtype(queryReshapeSizesInt,
                                            queryType.getOptionalDtype()),
             query, queryReshapeSizesList);
+        // Transpose from [batch, seq, heads, head_dim] to [batch, heads, seq,
+        // head_dim]
+        SmallVector<int64_t> queryTransposedSizesInt{batchSize, numHeads,
+                                                     sequenceLength, headSize};
+        Value permuteDimsList =
+            createConstantIntList(binder, rewriter, {0, 2, 1, 3});
+        Value qInput = Torch::AtenPermuteOp::create(
+            rewriter, loc,
+            queryType.getWithSizesAndDtype(queryTransposedSizesInt,
+                                           queryType.getOptionalDtype()),
+            qReshaped, permuteDimsList);
 
-        // Reshaping key.
-        SmallVector<int64_t> kvReshapeSizesInt{batchSize, kvNumHeads,
-                                               sequenceLength, headSize};
+        // Reshaping key from [batch, seq, kv_hidden] to [batch, kv_heads, seq,
+        // head_dim].
+        SmallVector<int64_t> kvReshapeSizesInt{batchSize, sequenceLength,
+                                               kvNumHeads, headSize};
         Value kvReshapeSizesList = Torch::PrimListConstructOp::create(
             rewriter, binder.getLoc(),
             Torch::ListType::get(Torch::IntType::get(query.getContext())),
-            llvm::SmallVector<Value>{cstBatchSize, cstKVNumHeads,
-                                     cstSequenceLength, cstHeadSize});
+            llvm::SmallVector<Value>{cstBatchSize, cstSequenceLength,
+                                     cstKVNumHeads, cstHeadSize});
         Torch::ValueTensorType keyType =
             cast<Torch::ValueTensorType>(key.getType());
-        Value kInput = Torch::AtenReshapeOp::create(
+        Value kReshaped = Torch::AtenReshapeOp::create(
             rewriter, loc,
             keyType.getWithSizesAndDtype(kvReshapeSizesInt,
                                          keyType.getOptionalDtype()),
             key, kvReshapeSizesList);
+        SmallVector<int64_t> kvTransposedSizesInt{batchSize, kvNumHeads,
+                                                  sequenceLength, headSize};
+        Value kInput = Torch::AtenPermuteOp::create(
+            rewriter, loc,
+            keyType.getWithSizesAndDtype(kvTransposedSizesInt,
+                                         keyType.getOptionalDtype()),
+            kReshaped, permuteDimsList);
 
-        // Reshaping value.
+        // Reshaping value from [batch, seq, kv_hidden] to [batch, kv_heads,
+        // seq, head_dim].
         Torch::ValueTensorType valueType =
             cast<Torch::ValueTensorType>(value.getType());
-        Value vInput = Torch::AtenReshapeOp::create(
+        Value vReshaped = Torch::AtenReshapeOp::create(
             rewriter, loc,
             valueType.getWithSizesAndDtype(kvReshapeSizesInt,
                                            valueType.getOptionalDtype()),
             value, kvReshapeSizesList);
+        Value vInput = Torch::AtenPermuteOp::create(
+            rewriter, loc,
+            valueType.getWithSizesAndDtype(kvTransposedSizesInt,
+                                           valueType.getOptionalDtype()),
+            vReshaped, permuteDimsList);
 
         Value cstNone = Torch::ConstantNoneOp::create(rewriter, loc);
         Value cstFalse = Torch::ConstantBoolOp::create(rewriter, loc, false);
+        Value cstTrue = Torch::ConstantBoolOp::create(rewriter, loc, true);
 
         Value qRotary = qInput, kRotary = kInput;
         if (doRotary) {
@@ -661,7 +742,54 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               /*scale=*/cstFloatOne);
         }
 
-        // Do attention.
+        // Update KV cache and prepare keys/values for attention.
+        // For in-place KV cache:
+        // 1. Write new K/V to pre-allocated cache at position
+        // [past_len:past_len+seq_len]
+        // 2. Slice active portion [0:total_seq_len] for attention
+        // 3. Return updated cache as present_key/present_value
+
+        // Get total sequence length from the scalar input
+        // totalSequenceLength is a scalar tensor [1] containing the total seq
+        // len
+        Value totalSeqLen = Torch::AtenItemOp::create(
+            rewriter, loc, rewriter.getType<Torch::IntType>(),
+            totalSequenceLength);
+
+        // past_seq_len = total_seq_len - current_seq_len
+        Value pastSeqLen = Torch::AtenSubIntOp::create(
+            rewriter, loc, totalSeqLen, cstSequenceLength);
+        Value cstIntOne = Torch::ConstantIntOp::create(
+            rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(1));
+
+        // Compute end position for slice scatter: past_seq_len +
+        // current_seq_len = total_seq_len
+        Value cstCacheDim = Torch::ConstantIntOp::create(
+            rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(2));
+        Value cstIntZero = Torch::ConstantIntOp::create(
+            rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(0));
+
+        // Write new K/V to cache using slice_scatter
+        // present_key = past_key.slice_scatter(kRotary, dim=2,
+        // start=past_seq_len, end=total_seq_len)
+        Value presentKey = Torch::AtenSliceScatterOp::create(
+            rewriter, loc, pastKey.getType(), pastKey, kRotary, cstCacheDim,
+            pastSeqLen, totalSeqLen, cstIntOne);
+        Value presentValue = Torch::AtenSliceScatterOp::create(
+            rewriter, loc, pastValue.getType(), pastValue, vInput, cstCacheDim,
+            pastSeqLen, totalSeqLen, cstIntOne);
+
+        // Slice active portion for attention: [0:total_seq_len]
+        // The sliced tensors have the same type as presentKey/presentValue
+        // (the slice operation returns a tensor with dynamic seq dim)
+        Value activeKey = Torch::AtenSliceTensorOp::create(
+            rewriter, loc, presentKey.getType(), presentKey, cstCacheDim,
+            cstIntZero, totalSeqLen, cstIntOne);
+        Value activeValue = Torch::AtenSliceTensorOp::create(
+            rewriter, loc, presentValue.getType(), presentValue, cstCacheDim,
+            cstIntZero, totalSeqLen, cstIntOne);
+
+        // Do attention using the full active cache
         Value cstEnableGQA = Torch::ConstantBoolOp::create(rewriter, loc, true);
         Value cstFloatZero = Torch::ConstantFloatOp::create(
             rewriter, binder.getLoc(), rewriter.getType<Torch::FloatType>(),
@@ -672,55 +800,36 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               rewriter, binder.getLoc(), rewriter.getType<Torch::FloatType>(),
               rewriter.getF64FloatAttr(scale));
         Value attention = Torch::AtenScaledDotProductAttentionOp::create(
-            rewriter, loc, qRotary.getType(), qRotary, kRotary, vInput,
+            rewriter, loc, qRotary.getType(), qRotary, activeKey, activeValue,
             /*attn_mask=*/cstNone,
-            /*dropout_p=*/cstFloatZero, /*is_causal=*/cstFalse, cstScale,
+            /*dropout_p=*/cstFloatZero, /*is_causal=*/cstTrue, cstScale,
             cstEnableGQA);
         // Reshaping the attention result from:
         //    (batch_size, num_heads, sequence_length, head_size)
         // -> (batch_size, sequence_length, hidden_size)
+        // First transpose from [batch, heads, seq, head_dim] to [batch, seq,
+        // heads, head_dim]
+        Value outputPermuteDimsList =
+            createConstantIntList(binder, rewriter, {0, 2, 1, 3});
+        SmallVector<int64_t> attentionTransposedSizes{batchSize, sequenceLength,
+                                                      numHeads, headSize};
+        Value attentionTransposed = Torch::AtenPermuteOp::create(
+            rewriter, loc,
+            queryType.getWithSizesAndDtype(attentionTransposedSizes,
+                                           queryType.getOptionalDtype()),
+            attention, outputPermuteDimsList);
+        // Then reshape to [batch, seq, hidden]
         Value attentionResultSizesList = Torch::PrimListConstructOp::create(
             rewriter, binder.getLoc(),
             Torch::ListType::get(Torch::IntType::get(attention.getContext())),
             llvm::SmallVector<Value>{cstBatchSize, cstSequenceLength,
                                      cstHiddenSize});
-        attention = Torch::AtenReshapeOp::create(
-            rewriter, loc, resultTypes[0], attention, attentionResultSizesList);
+        attention = Torch::AtenReshapeOp::create(rewriter, loc, resultTypes[0],
+                                                 attentionTransposed,
+                                                 attentionResultSizesList);
 
-        // Compute 2nd and 3rd result: present_key, present_value.
-        // present_key = torch.cat([past_key, key], dim=2) or past_key
-        // present_value = torch.cat([past_value, value], dim=2) or past_value
-        Value presentKey = pastKey, presentValue = pastValue;
-        if (!llvm::equal(
-                cast<Torch::ValueTensorType>(pastKey.getType()).getSizes(),
-                cast<Torch::ValueTensorType>(resultTypes[1]).getSizes())) {
-          Value cstConcatDim = Torch::ConstantIntOp::create(
-              rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(2));
-          Type kvListElemType = keyType.getWithSizesAndDtype(
-              /*optionalSizes=*/std::nullopt,
-              /*optionalDtype=*/nullptr);
-          Type kvListType = Torch::ListType::get(kvListElemType);
-          Value keyList = Torch::PrimListConstructOp::create(
-              rewriter, loc, kvListType, SmallVector<Value>{pastKey, kRotary});
-          presentKey = Torch::AtenCatOp::create(rewriter, loc, resultTypes[1],
-                                                keyList, cstConcatDim);
-        }
-
-        if (!llvm::equal(
-                cast<Torch::ValueTensorType>(pastValue.getType()).getSizes(),
-                cast<Torch::ValueTensorType>(resultTypes[2]).getSizes())) {
-          Value cstConcatDim = Torch::ConstantIntOp::create(
-              rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(2));
-          Type kvListElemType = keyType.getWithSizesAndDtype(
-              /*optionalSizes=*/std::nullopt,
-              /*optionalDtype=*/nullptr);
-          Type kvListType = Torch::ListType::get(kvListElemType);
-          Value valueList = Torch::PrimListConstructOp::create(
-              rewriter, loc, kvListType, SmallVector<Value>{pastValue, vInput});
-          presentValue = Torch::AtenCatOp::create(rewriter, loc, resultTypes[2],
-                                                  valueList, cstConcatDim);
-        }
-
+        // Return attention result and updated KV cache
+        // presentKey and presentValue were computed earlier via slice_scatter
         rewriter.replaceOp(binder.op, {attention, presentKey, presentValue});
         return success();
       });
