@@ -13048,6 +13048,196 @@ public:
     return success();
   }
 };
+
+// Decompose torch.onnx.matmul_integer to primitive Torch ops.
+// For UINT8 inputs (asymmetric quantization), we use the XOR approach:
+//   1. XOR UINT8 with 0x80 to convert to INT8 representation
+//      A' = A XOR 0x80  =>  A' (as INT8) = A_uint8 - 128
+//   2. Compute matmul: A' @ B' -> INT32
+//   3. Add correction terms in INT32:
+//      - For UINT8 LHS: (128 - zp_a) * col_sum(B)
+//      - For UINT8 RHS: row_sum(A) * (128 - zp_b)
+//      - For both UINT8: K * (128 - zp_a) * (128 - zp_b)
+
+/// Check if a value is a ConstantNoneOp.
+static bool isNoneValue(Value v) {
+  if (auto *defOp = v.getDefiningOp())
+    return isa<ConstantNoneOp>(defOp);
+  return false;
+}
+
+/// Check if tensor has unsigned 8-bit integer element type.
+static bool isUnsignedInt8Tensor(Value tensor) {
+  auto tensorTy = dyn_cast<ValueTensorType>(tensor.getType());
+  if (!tensorTy)
+    return false;
+  auto elemTy = tensorTy.getDtype();
+  if (auto intTy = dyn_cast<mlir::IntegerType>(elemTy))
+    return intTy.isUnsigned() && intTy.getWidth() == 8;
+  return false;
+}
+
+/// XOR a tensor with a mask value, converting to signed INT8 representation.
+/// For mask=0x80, this maps UINT8 value x to INT8 value (x - 128).
+static Value xorTensorWithMask(PatternRewriter &rewriter, Location loc,
+                               Value tensor, int64_t mask) {
+  auto *ctx = rewriter.getContext();
+  auto tensorTy = cast<ValueTensorType>(tensor.getType());
+  Value xorMask =
+      ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(mask));
+  Value noneVal = ConstantNoneOp::create(rewriter, loc);
+  Value xorMaskTensor =
+      AtenFullLikeOp::create(rewriter, loc, tensor.getType(), tensor, xorMask,
+                             noneVal, noneVal, noneVal, noneVal, noneVal);
+  auto si8Dtype = mlir::IntegerType::get(ctx, 8, mlir::IntegerType::Signed);
+  auto xoredTy = ValueTensorType::get(ctx, tensorTy.getSizes(), si8Dtype);
+  return AtenBitwiseXorTensorOp::create(rewriter, loc, xoredTy, tensor,
+                                        xorMaskTensor);
+}
+
+/// Compute (128 - zeroPoint) as a scalar int for correction terms.
+/// If hasZeroPoint is false, returns constant 128.
+static Value computeCorrectionScale(PatternRewriter &rewriter, Location loc,
+                                    Value zeroPoint, bool hasZeroPoint) {
+  Value const128 =
+      ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(128));
+  if (!hasZeroPoint)
+    return const128;
+  Value zpScalar = zeroPoint;
+  if (isa<ValueTensorType>(zeroPoint.getType()))
+    zpScalar = AtenItemOp::create(rewriter, loc, rewriter.getType<IntType>(),
+                                  zeroPoint);
+  return AtenSubIntOp::create(rewriter, loc, const128, zpScalar);
+}
+
+/// Add a sum-based correction term to the result.
+/// Computes: result += (correctionScale * sum(tensor, dim, keepdim))
+static Value addSumCorrection(PatternRewriter &rewriter, Location loc,
+                              Value result, ValueTensorType resultType,
+                              Value tensor, int64_t reduceDim, bool keepdim,
+                              Value corrScale, Value alphaInt,
+                              mlir::IntegerType si32Dtype) {
+  auto *ctx = rewriter.getContext();
+  auto tensorTy = cast<ValueTensorType>(tensor.getType());
+  auto tensorShape = tensorTy.getSizes();
+
+  // Convert tensor to INT32 for summation
+  Value tensorInt32 = convertTensorToDtype(rewriter, loc, tensor, si32Dtype);
+
+  Value reduceDimVal =
+      ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(reduceDim));
+  Value dimList = PrimListConstructOp::create(
+      rewriter, loc, ListType::get(IntType::get(ctx)),
+      SmallVector<Value>{reduceDimVal});
+  Value keepdimVal = ConstantBoolOp::create(rewriter, loc, keepdim);
+  Value noneVal = ConstantNoneOp::create(rewriter, loc);
+
+  // Compute output shape for the sum
+  SmallVector<int64_t> sumShape;
+  for (size_t i = 0; i < tensorShape.size(); ++i) {
+    if (static_cast<int64_t>(i) == reduceDim) {
+      if (keepdim)
+        sumShape.push_back(1);
+    } else {
+      sumShape.push_back(tensorShape[i]);
+    }
+  }
+  auto sumTy = ValueTensorType::get(ctx, sumShape, si32Dtype);
+
+  Value sum = AtenSumDimIntListOp::create(rewriter, loc, sumTy, tensorInt32,
+                                          dimList, keepdimVal, noneVal);
+
+  Value correction =
+      AtenMulScalarOp::create(rewriter, loc, sumTy, sum, corrScale);
+  return AtenAddTensorOp::create(rewriter, loc, resultType, result, correction,
+                                 alphaInt);
+}
+
+class DecomposeOnnxMatmulIntegerOp
+    : public OpRewritePattern<OnnxMatmulIntegerOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(OnnxMatmulIntegerOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value lhs = op.getLhs();
+    Value rhs = op.getRhs();
+    Value lhsZp = op.getLhsZeroPoint();
+    Value rhsZp = op.getRhsZeroPoint();
+    auto resultType = cast<ValueTensorType>(op.getType());
+
+    auto *ctx = op.getContext();
+    auto si32Dtype =
+        mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Signed);
+
+    // Check if zero points are provided (not None)
+    bool hasLhsZp = !isNoneValue(lhsZp);
+    bool hasRhsZp = !isNoneValue(rhsZp);
+
+    // Check if we have UINT8 inputs that need XOR treatment
+    bool lhsWasUint8 = isUnsignedInt8Tensor(lhs);
+    bool rhsWasUint8 = isUnsignedInt8Tensor(rhs);
+
+    // Apply XOR for UINT8 inputs
+    if (lhsWasUint8)
+      lhs = xorTensorWithMask(rewriter, loc, lhs, 0x80);
+    if (rhsWasUint8)
+      rhs = xorTensorWithMask(rewriter, loc, rhs, 0x80);
+
+    // Perform matmul (INT8 x INT8 -> INT32)
+    Value result = AtenMatmulOp::create(rewriter, loc, resultType, lhs, rhs);
+
+    // Add correction terms in INT32
+    Value alphaInt =
+        ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
+
+    if (lhsWasUint8) {
+      // col_sum(B): sum along K dimension (dim -2 for 2D, second-to-last)
+      auto rhsTy = cast<ValueTensorType>(rhs.getType());
+      int64_t reduceDim =
+          rhsTy.getSizes().size() >= 2 ? rhsTy.getSizes().size() - 2 : 0;
+      Value corrScale =
+          computeCorrectionScale(rewriter, loc, lhsZp, hasLhsZp);
+      result = addSumCorrection(rewriter, loc, result, resultType, rhs,
+                                reduceDim, /*keepdim=*/false, corrScale,
+                                alphaInt, si32Dtype);
+    }
+
+    if (rhsWasUint8) {
+      // row_sum(A): sum along K dimension (last dim), keepdim for broadcast
+      auto lhsTy = cast<ValueTensorType>(lhs.getType());
+      int64_t reduceDim = lhsTy.getSizes().size() - 1;
+      Value corrScale =
+          computeCorrectionScale(rewriter, loc, rhsZp, hasRhsZp);
+      result = addSumCorrection(rewriter, loc, result, resultType, lhs,
+                                reduceDim, /*keepdim=*/true, corrScale,
+                                alphaInt, si32Dtype);
+    }
+
+    // When both sides were UINT8, add cross-term: K * (128 - zp_a) * (128 -
+    // zp_b)
+    if (lhsWasUint8 && rhsWasUint8) {
+      auto lhsTy = cast<ValueTensorType>(lhs.getType());
+      auto lhsShape = lhsTy.getSizes();
+      int64_t K = lhsShape.back();
+
+      Value corrA = computeCorrectionScale(rewriter, loc, lhsZp, hasLhsZp);
+      Value corrB = computeCorrectionScale(rewriter, loc, rhsZp, hasRhsZp);
+
+      Value kVal =
+          ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(K));
+      Value crossTerm = AtenMulIntOp::create(rewriter, loc, corrA, corrB);
+      crossTerm = AtenMulIntOp::create(rewriter, loc, kVal, crossTerm);
+
+      result = AtenAddScalarOp::create(rewriter, loc, resultType, result,
+                                       crossTerm, alphaInt);
+    }
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 } // namespace
 
 namespace {
@@ -13381,6 +13571,7 @@ public:
     addPatternIfTargetOpIsIllegal<DecomposeAten_AssertScalarOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenRoundDecimalsOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenAsStridedOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeOnnxMatmulIntegerOp>(patterns);
 
     GreedyRewriteConfig config;
     config.setUseTopDownTraversal(true);

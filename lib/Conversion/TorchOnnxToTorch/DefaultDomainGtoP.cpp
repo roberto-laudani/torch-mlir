@@ -555,6 +555,7 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
   patterns.onOp(
       "MatMulInteger", 10,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        // Emit torch.onnx.matmul_integer which will be decomposed later
         Location loc = binder.getLoc();
         Torch::ValueTensorType resultType;
         Value lhs, rhs, lhsZp, rhsZp;
@@ -563,54 +564,15 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
             binder.tensorResultType(resultType))
           return failure();
 
-        if (binder.tensorOperandAtIndex(lhsZp, 2)) {
-          lhsZp = Torch::ConstantIntOp::create(
-              rewriter, binder.getLoc(), rewriter.getType<Torch::IntType>(),
-              rewriter.getIntegerAttr(rewriter.getIntegerType(64), 0));
-        }
+        // Zero points are optional - use None if not provided
+        Value noneVal = Torch::ConstantNoneOp::create(rewriter, loc);
+        if (failed(binder.tensorOperandAtIndex(lhsZp, 2)))
+          lhsZp = noneVal;
+        if (failed(binder.tensorOperandAtIndex(rhsZp, 3)))
+          rhsZp = noneVal;
 
-        if (binder.tensorOperandAtIndex(rhsZp, 3)) {
-          rhsZp = Torch::ConstantIntOp::create(
-              rewriter, binder.getLoc(), rewriter.getType<Torch::IntType>(),
-              rewriter.getIntegerAttr(rewriter.getIntegerType(64), 0));
-        }
-
-        // This op is lowered as follows:
-        // lhs = lhs.to(dtype=torch.int32)
-        // rhs = rhs.to(dtype=torch.int32)
-        // lhs = lhs - lhsZp
-        // rhs = rhs - rhsZp
-        // res = torch.mm(lhs, rhs)
-
-        // Converting lhs and rhs tensor to `si32` type.
-        lhs = Torch::convertTensorToDtype(
-            rewriter, loc, lhs,
-            mlir::IntegerType::get(binder.op->getContext(), 32,
-                                   mlir::IntegerType::Signed));
-        rhs = Torch::convertTensorToDtype(
-            rewriter, loc, rhs,
-            mlir::IntegerType::get(binder.op->getContext(), 32,
-                                   mlir::IntegerType::Signed));
-
-        // Subtracting the zero_point values from lhs and rhs.
-        Value alpha = Torch::ConstantIntOp::create(
-            rewriter, loc, rewriter.getI64IntegerAttr(1));
-        if (auto lhsZpTy = dyn_cast<Torch::ValueTensorType>(lhsZp.getType()))
-          lhs = Torch::AtenSubTensorOp::create(rewriter, loc, lhs.getType(),
-                                               lhs, lhsZp, alpha);
-        else
-          lhs = Torch::AtenSubScalarOp::create(rewriter, loc, lhs.getType(),
-                                               lhs, lhsZp, alpha);
-
-        if (auto rhsZpTy = dyn_cast<Torch::ValueTensorType>(rhsZp.getType()))
-          rhs = Torch::AtenSubTensorOp::create(rewriter, loc, rhs.getType(),
-                                               rhs, rhsZp, alpha);
-        else
-          rhs = Torch::AtenSubScalarOp::create(rewriter, loc, rhs.getType(),
-                                               rhs, rhsZp, alpha);
-
-        rewriter.replaceOpWithNewOp<Torch::AtenMatmulOp>(binder.op, resultType,
-                                                         lhs, rhs);
+        rewriter.replaceOpWithNewOp<Torch::OnnxMatmulIntegerOp>(
+            binder.op, resultType, lhs, rhs, lhsZp, rhsZp);
         return success();
       });
   patterns.onOp("Mul", 7,

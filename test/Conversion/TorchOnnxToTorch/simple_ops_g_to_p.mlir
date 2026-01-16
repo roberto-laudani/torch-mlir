@@ -566,13 +566,8 @@ func.func @test_matmul_4d(%arg0: !torch.vtensor<[1,2,3,4],f32>, %arg1: !torch.vt
 
 // CHECK-LABEL: @test_matmulinteger
 func.func @test_matmulinteger(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],ui8>, %arg2: !torch.vtensor<[1],ui8>, %arg3: !torch.vtensor<[1],ui8>) -> !torch.vtensor<[4,2],si32> attributes {torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 10 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+  // CHECK: torch.onnx.matmul_integer %arg0, %arg1, %arg2, %arg3 : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],ui8>, !torch.vtensor<[1],ui8>, !torch.vtensor<[1],ui8> -> !torch.vtensor<[4,2],si32>
   %0 = torch.operator "onnx.MatMulInteger"(%arg0, %arg1, %arg2, %arg3) : (!torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],ui8>, !torch.vtensor<[1],ui8>, !torch.vtensor<[1],ui8>) -> !torch.vtensor<[4,2],si32>
-  // CHECK: %[[LHS:.*]] = torch.aten.to.dtype %arg0, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[4,3],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[4,3],si32>
-  // CHECK: %[[RHS:.*]] = torch.aten.to.dtype %arg1, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[3,2],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[3,2],si32>
-  // CHECK: %[[LHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[LHS]], %arg2, %{{.+}} : !torch.vtensor<[4,3],si32>, !torch.vtensor<[1],ui8>, !torch.int -> !torch.vtensor<[4,3],si32>
-  // CHECK: %[[RHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[RHS]], %arg3, %{{.+}} : !torch.vtensor<[3,2],si32>, !torch.vtensor<[1],ui8>, !torch.int -> !torch.vtensor<[3,2],si32>
-  // CHECK: %[[MM:.+]] = torch.aten.matmul %[[LHS_MINUS_ZP]], %[[RHS_MINUS_ZP]] : !torch.vtensor<[4,3],si32>, !torch.vtensor<[3,2],si32> -> !torch.vtensor<[4,2],si32>
-  // CHECK: return %[[MM]] : !torch.vtensor<[4,2],si32>
   return %0 : !torch.vtensor<[4,2],si32>
 }
 
@@ -580,42 +575,9 @@ func.func @test_matmulinteger(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vt
 
 // CHECK-LABEL: @test_matmulinteger_batched
 func.func @test_matmulinteger_batched(%arg0: !torch.vtensor<[7,4,3],ui8>, %arg1: !torch.vtensor<[3,2],ui8>, %arg2: !torch.vtensor<[1],ui8>, %arg3: !torch.vtensor<[1],ui8>) -> !torch.vtensor<[7,4,2],si32> attributes {torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 10 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
+  // CHECK: torch.onnx.matmul_integer %arg0, %arg1, %arg2, %arg3 : !torch.vtensor<[7,4,3],ui8>, !torch.vtensor<[3,2],ui8>, !torch.vtensor<[1],ui8>, !torch.vtensor<[1],ui8> -> !torch.vtensor<[7,4,2],si32>
   %0 = torch.operator "onnx.MatMulInteger"(%arg0, %arg1, %arg2, %arg3) : (!torch.vtensor<[7,4,3],ui8>, !torch.vtensor<[3,2],ui8>, !torch.vtensor<[1],ui8>, !torch.vtensor<[1],ui8>) -> !torch.vtensor<[7,4,2],si32>
-  // CHECK: %[[LHS:.*]] = torch.aten.to.dtype %arg0, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[7,4,3],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[7,4,3],si32>
-  // CHECK: %[[RHS:.*]] = torch.aten.to.dtype %arg1, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[3,2],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[3,2],si32>
-  // CHECK: %[[LHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[LHS]], %arg2, %{{.+}} : !torch.vtensor<[7,4,3],si32>, !torch.vtensor<[1],ui8>, !torch.int -> !torch.vtensor<[7,4,3],si32>
-  // CHECK: %[[RHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[RHS]], %arg3, %{{.+}} : !torch.vtensor<[3,2],si32>, !torch.vtensor<[1],ui8>, !torch.int -> !torch.vtensor<[3,2],si32>
-  // CHECK: %[[MM:.+]] = torch.aten.matmul %[[LHS_MINUS_ZP]], %[[RHS_MINUS_ZP]] : !torch.vtensor<[7,4,3],si32>, !torch.vtensor<[3,2],si32> -> !torch.vtensor<[7,4,2],si32>
-  // CHECK: return %[[MM]] : !torch.vtensor<[7,4,2],si32>
   return %0 : !torch.vtensor<[7,4,2],si32>
-}
-
-// -----
-
-// CHECK-LABEL:   func.func @test_matmulinteger_non_scalar_lhsZp(
-func.func @test_matmulinteger_non_scalar_lhsZp(%arg0: !torch.vtensor<[16, 2],ui8>, %arg1: !torch.vtensor<[2,768],si8>,  %arg2: !torch.vtensor<[16,1],ui8>, %arg3: !torch.vtensor<[],si8>) ->  !torch.vtensor<[16,768],si32> attributes {torch.onnx_meta.ir_version = 7 : si64, torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.producer_name = "pytorch", torch.onnx_meta.producer_version = "0.1.0"} {
-  // CHECK: %[[LHS:.*]] = torch.aten.to.dtype %arg0, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[16,2],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[16,2],si32>
-  // CHECK: %[[RHS:.*]] = torch.aten.to.dtype %arg1, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[2,768],si8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[2,768],si32>
-  // CHECK: %[[LHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[LHS]], %arg2, %{{.+}} : !torch.vtensor<[16,2],si32>, !torch.vtensor<[16,1],ui8>, !torch.int -> !torch.vtensor<[16,2],si32>
-  // CHECK: %[[RHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[RHS]], %arg3, %{{.+}} : !torch.vtensor<[2,768],si32>, !torch.vtensor<[],si8>, !torch.int -> !torch.vtensor<[2,768],si32>
-  // CHECK: %[[MM:.+]] = torch.aten.matmul %[[LHS_MINUS_ZP]], %[[RHS_MINUS_ZP]] : !torch.vtensor<[16,2],si32>, !torch.vtensor<[2,768],si32> -> !torch.vtensor<[16,768],si32>
-  // CHECK: return %[[MM]] : !torch.vtensor<[16,768],si32>
-  %0 = torch.operator "onnx.MatMulInteger"(%arg0, %arg1, %arg2, %arg3) : (!torch.vtensor<[16,2],ui8>, !torch.vtensor<[2,768],si8>, !torch.vtensor<[16,1],ui8>, !torch.vtensor<[],si8>) -> !torch.vtensor<[16,768],si32>
-  return %0 : !torch.vtensor<[16,768],si32>
-}
-
-// -----
-
-// CHECK-LABEL:   func.func @test_matmulinteger_non_scalar_rhsZp(
-func.func @test_matmulinteger_non_scalar_rhsZp(%arg0: !torch.vtensor<[?,?],ui8>, %arg1: !torch.vtensor<[2,768],si8>,  %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[768],si8>) ->  !torch.vtensor<[?,768],si32> attributes {torch.onnx_meta.ir_version = 7 : si64, torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.producer_name = "pytorch", torch.onnx_meta.producer_version = "0.1.0"} {
-  // CHECK: %[[LHS:.*]] = torch.aten.to.dtype %arg0, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[?,?],ui8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[?,?],si32>
-  // CHECK: %[[RHS:.*]] = torch.aten.to.dtype %arg1, %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[2,768],si8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[2,768],si32>
-  // CHECK: %[[LHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[LHS]], %arg2, %{{.+}} : !torch.vtensor<[?,?],si32>, !torch.vtensor<[],ui8>, !torch.int -> !torch.vtensor<[?,?],si32>
-  // CHECK: %[[RHS_MINUS_ZP:.*]] = torch.aten.sub.Tensor %[[RHS]], %arg3, %{{.+}} : !torch.vtensor<[2,768],si32>, !torch.vtensor<[768],si8>, !torch.int -> !torch.vtensor<[2,768],si32>
-  // CHECK: %[[MM:.+]] = torch.aten.matmul %[[LHS_MINUS_ZP]], %[[RHS_MINUS_ZP]] : !torch.vtensor<[?,?],si32>, !torch.vtensor<[2,768],si32> -> !torch.vtensor<[?,768],si32>
-  // CHECK: return %[[MM]] : !torch.vtensor<[?,768],si32>
-  %0 = torch.operator "onnx.MatMulInteger"(%arg0, %arg1, %arg2, %arg3) : (!torch.vtensor<[?,?],ui8>, !torch.vtensor<[2,768],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[768],si8>) -> !torch.vtensor<[?,768],si32>
-  return %0 : !torch.vtensor<[?,768],si32>
 }
 
 // -----

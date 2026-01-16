@@ -955,3 +955,117 @@ func.func @torch.aten.masked_scatter$dynamic(%arg0: !torch.vtensor<[?,?],f32>, %
   %0 = torch.aten.masked_scatter %arg0, %arg1, %arg2 : !torch.vtensor<[?,?],f32>, !torch.vtensor<[?,?],i1>, !torch.vtensor<[?,?],f32> -> !torch.vtensor<[?,?],f32>
   return %0 : !torch.vtensor<[?,?],f32>
 }
+
+// -----
+
+// Decomposition of onnx.matmul_integer for UINT8 inputs with zero points.
+// The math for (A - zp_a) @ (B - zp_b) with UINT8 inputs is:
+//   1. XOR with 0x80 to convert UINT8 [0,255] to INT8 [-128,127]: A' = A ^ 0x80
+//   2. Core matmul: A' @ B'
+//   3. LHS correction: (128 - zp_a) * col_sum(B')
+//   4. RHS correction: row_sum(A') * (128 - zp_b)
+//   5. Cross term: K * (128 - zp_a) * (128 - zp_b), where K is the inner dimension
+// CHECK-LABEL:   func.func @onnx_matmul_integer_uint8_both(
+// CHECK-SAME:        %[[LHS:.*]]: !torch.vtensor<[4,3],ui8>,
+// CHECK-SAME:        %[[RHS:.*]]: !torch.vtensor<[3,2],ui8>,
+// CHECK-SAME:        %[[LHS_ZP:.*]]: !torch.vtensor<[],ui8>,
+// CHECK-SAME:        %[[RHS_ZP:.*]]: !torch.vtensor<[],ui8>) -> !torch.vtensor<[4,2],si32> {
+// CHECK-DAG:       %[[C128:.*]] = torch.constant.int 128
+// CHECK-DAG:       %[[C1:.*]] = torch.constant.int 1
+// CHECK-DAG:       %[[C0:.*]] = torch.constant.int 0
+// CHECK-DAG:       %[[C3:.*]] = torch.constant.int 3
+// CHECK-DAG:       %[[NONE:.*]] = torch.constant.none
+// CHECK-DAG:       %[[FALSE:.*]] = torch.constant.bool false
+//
+// Step 1: XOR with 0x80 to convert UINT8 to INT8
+// CHECK:           %[[LHS_MASK:.*]] = torch.aten.full_like %[[LHS]], %[[C128]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.vtensor<[4,3],ui8>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[4,3],ui8>
+// CHECK:           %[[LHS_XORED:.*]] = torch.aten.bitwise_xor.Tensor %[[LHS]], %[[LHS_MASK]] : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[4,3],ui8> -> !torch.vtensor<[4,3],si8>
+// CHECK:           %[[RHS_MASK:.*]] = torch.aten.full_like %[[RHS]], %[[C128]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.vtensor<[3,2],ui8>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[3,2],ui8>
+// CHECK:           %[[RHS_XORED:.*]] = torch.aten.bitwise_xor.Tensor %[[RHS]], %[[RHS_MASK]] : !torch.vtensor<[3,2],ui8>, !torch.vtensor<[3,2],ui8> -> !torch.vtensor<[3,2],si8>
+//
+// Step 2: Core matmul (A' @ B')
+// CHECK:           %[[MM:.*]] = torch.aten.matmul %[[LHS_XORED]], %[[RHS_XORED]] : !torch.vtensor<[4,3],si8>, !torch.vtensor<[3,2],si8> -> !torch.vtensor<[4,2],si32>
+//
+// Step 3: LHS correction term: (128 - zp_a) * col_sum(B')
+// CHECK:           %[[LHS_ZP_ITEM:.*]] = torch.aten.item %[[LHS_ZP]] : !torch.vtensor<[],ui8> -> !torch.int
+// CHECK:           %[[LHS_CORR_SCALE:.*]] = torch.aten.sub.int %[[C128]], %[[LHS_ZP_ITEM]] : !torch.int, !torch.int -> !torch.int
+// CHECK:           %[[RHS_I32:.*]] = torch.aten.to.dtype %[[RHS_XORED]], %{{.*}}, %[[FALSE]], %[[FALSE]], %[[NONE]] : !torch.vtensor<[3,2],si8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[3,2],si32>
+// CHECK:           %[[DIM_LIST_0:.*]] = torch.prim.ListConstruct %[[C0]] : (!torch.int) -> !torch.list<int>
+// CHECK:           %[[COL_SUM:.*]] = torch.aten.sum.dim_IntList %[[RHS_I32]], %[[DIM_LIST_0]], %[[FALSE]], %[[NONE]] : !torch.vtensor<[3,2],si32>, !torch.list<int>, !torch.bool, !torch.none -> !torch.vtensor<[2],si32>
+// CHECK:           %[[LHS_CORR:.*]] = torch.aten.mul.Scalar %[[COL_SUM]], %[[LHS_CORR_SCALE]] : !torch.vtensor<[2],si32>, !torch.int -> !torch.vtensor<[2],si32>
+// CHECK:           %[[RESULT1:.*]] = torch.aten.add.Tensor %[[MM]], %[[LHS_CORR]], %[[C1]] : !torch.vtensor<[4,2],si32>, !torch.vtensor<[2],si32>, !torch.int -> !torch.vtensor<[4,2],si32>
+//
+// Step 4: RHS correction term: row_sum(A') * (128 - zp_b)
+// CHECK:           %[[RHS_ZP_ITEM:.*]] = torch.aten.item %[[RHS_ZP]] : !torch.vtensor<[],ui8> -> !torch.int
+// CHECK:           %[[RHS_CORR_SCALE:.*]] = torch.aten.sub.int %[[C128]], %[[RHS_ZP_ITEM]] : !torch.int, !torch.int -> !torch.int
+// CHECK:           %[[LHS_I32:.*]] = torch.aten.to.dtype %[[LHS_XORED]], %{{.*}}, %[[FALSE]], %[[FALSE]], %[[NONE]] : !torch.vtensor<[4,3],si8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[4,3],si32>
+// CHECK:           %[[DIM_LIST_1:.*]] = torch.prim.ListConstruct %[[C1]] : (!torch.int) -> !torch.list<int>
+// CHECK:           %[[TRUE:.*]] = torch.constant.bool true
+// CHECK:           %[[ROW_SUM:.*]] = torch.aten.sum.dim_IntList %[[LHS_I32]], %[[DIM_LIST_1]], %[[TRUE]], %[[NONE]] : !torch.vtensor<[4,3],si32>, !torch.list<int>, !torch.bool, !torch.none -> !torch.vtensor<[4,1],si32>
+// CHECK:           %[[RHS_CORR:.*]] = torch.aten.mul.Scalar %[[ROW_SUM]], %[[RHS_CORR_SCALE]] : !torch.vtensor<[4,1],si32>, !torch.int -> !torch.vtensor<[4,1],si32>
+// CHECK:           %[[RESULT2:.*]] = torch.aten.add.Tensor %[[RESULT1]], %[[RHS_CORR]], %[[C1]] : !torch.vtensor<[4,2],si32>, !torch.vtensor<[4,1],si32>, !torch.int -> !torch.vtensor<[4,2],si32>
+//
+// Step 5: Cross term: K * (128 - zp_a) * (128 - zp_b)
+// CHECK:           %[[CROSS_TERM1:.*]] = torch.aten.mul.int %[[LHS_CORR_SCALE]], %[[RHS_CORR_SCALE]] : !torch.int, !torch.int -> !torch.int
+// CHECK:           %[[CROSS_TERM:.*]] = torch.aten.mul.int %[[C3]], %[[CROSS_TERM1]] : !torch.int, !torch.int -> !torch.int
+// CHECK:           %[[RESULT:.*]] = torch.aten.add.Scalar %[[RESULT2]], %[[CROSS_TERM]], %[[C1]] : !torch.vtensor<[4,2],si32>, !torch.int, !torch.int -> !torch.vtensor<[4,2],si32>
+// CHECK:           return %[[RESULT]] : !torch.vtensor<[4,2],si32>
+func.func @onnx_matmul_integer_uint8_both(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],ui8>, %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[],ui8>) -> !torch.vtensor<[4,2],si32> {
+  %0 = torch.onnx.matmul_integer %arg0, %arg1, %arg2, %arg3 : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],ui8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],ui8> -> !torch.vtensor<[4,2],si32>
+  return %0 : !torch.vtensor<[4,2],si32>
+}
+
+// -----
+
+// For INT8 inputs, no XOR or correction terms are needed.
+// The matmul can be performed directly since INT8 already has symmetric range.
+// CHECK-LABEL:   func.func @onnx_matmul_integer_int8_both(
+// CHECK-SAME:        %[[LHS:.*]]: !torch.vtensor<[4,3],si8>,
+// CHECK-SAME:        %[[RHS:.*]]: !torch.vtensor<[3,2],si8>,
+// CHECK-SAME:        %[[LHS_ZP:.*]]: !torch.vtensor<[],si8>,
+// CHECK-SAME:        %[[RHS_ZP:.*]]: !torch.vtensor<[],si8>) -> !torch.vtensor<[4,2],si32> {
+// CHECK:           %[[RESULT:.*]] = torch.aten.matmul %[[LHS]], %[[RHS]] : !torch.vtensor<[4,3],si8>, !torch.vtensor<[3,2],si8> -> !torch.vtensor<[4,2],si32>
+// CHECK:           return %[[RESULT]] : !torch.vtensor<[4,2],si32>
+func.func @onnx_matmul_integer_int8_both(%arg0: !torch.vtensor<[4,3],si8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[],si8>, %arg3: !torch.vtensor<[],si8>) -> !torch.vtensor<[4,2],si32> {
+  %0 = torch.onnx.matmul_integer %arg0, %arg1, %arg2, %arg3 : !torch.vtensor<[4,3],si8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],si8>, !torch.vtensor<[],si8> -> !torch.vtensor<[4,2],si32>
+  return %0 : !torch.vtensor<[4,2],si32>
+}
+
+// -----
+
+// Mixed case: UINT8 LHS, INT8 RHS.
+// Only LHS needs XOR conversion and only the LHS correction term is needed.
+//   1. XOR LHS with 0x80: A' = A ^ 0x80
+//   2. Core matmul: A' @ B
+//   3. LHS correction: (128 - zp_a) * col_sum(B)
+// CHECK-LABEL:   func.func @onnx_matmul_integer_uint8_lhs_int8_rhs(
+// CHECK-SAME:        %[[LHS:.*]]: !torch.vtensor<[4,3],ui8>,
+// CHECK-SAME:        %[[RHS:.*]]: !torch.vtensor<[3,2],si8>,
+// CHECK-SAME:        %[[LHS_ZP:.*]]: !torch.vtensor<[],ui8>,
+// CHECK-SAME:        %[[RHS_ZP:.*]]: !torch.vtensor<[],si8>) -> !torch.vtensor<[4,2],si32> {
+// CHECK-DAG:       %[[C128:.*]] = torch.constant.int 128
+// CHECK-DAG:       %[[C1:.*]] = torch.constant.int 1
+// CHECK-DAG:       %[[C0:.*]] = torch.constant.int 0
+// CHECK-DAG:       %[[NONE:.*]] = torch.constant.none
+// CHECK-DAG:       %[[FALSE:.*]] = torch.constant.bool false
+//
+// Step 1: XOR LHS with 0x80 to convert UINT8 to INT8
+// CHECK:           %[[LHS_MASK:.*]] = torch.aten.full_like %[[LHS]], %[[C128]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.vtensor<[4,3],ui8>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[4,3],ui8>
+// CHECK:           %[[LHS_XORED:.*]] = torch.aten.bitwise_xor.Tensor %[[LHS]], %[[LHS_MASK]] : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[4,3],ui8> -> !torch.vtensor<[4,3],si8>
+//
+// Step 2: Core matmul (A' @ B)
+// CHECK:           %[[MM:.*]] = torch.aten.matmul %[[LHS_XORED]], %[[RHS]] : !torch.vtensor<[4,3],si8>, !torch.vtensor<[3,2],si8> -> !torch.vtensor<[4,2],si32>
+//
+// Step 3: LHS correction term: (128 - zp_a) * col_sum(B)
+// CHECK:           %[[LHS_ZP_ITEM:.*]] = torch.aten.item %[[LHS_ZP]] : !torch.vtensor<[],ui8> -> !torch.int
+// CHECK:           %[[LHS_CORR_SCALE:.*]] = torch.aten.sub.int %[[C128]], %[[LHS_ZP_ITEM]] : !torch.int, !torch.int -> !torch.int
+// CHECK:           %[[RHS_I32:.*]] = torch.aten.to.dtype %[[RHS]], %{{.*}}, %[[FALSE]], %[[FALSE]], %[[NONE]] : !torch.vtensor<[3,2],si8>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[3,2],si32>
+// CHECK:           %[[DIM_LIST:.*]] = torch.prim.ListConstruct %[[C0]] : (!torch.int) -> !torch.list<int>
+// CHECK:           %[[COL_SUM:.*]] = torch.aten.sum.dim_IntList %[[RHS_I32]], %[[DIM_LIST]], %[[FALSE]], %[[NONE]] : !torch.vtensor<[3,2],si32>, !torch.list<int>, !torch.bool, !torch.none -> !torch.vtensor<[2],si32>
+// CHECK:           %[[LHS_CORR:.*]] = torch.aten.mul.Scalar %[[COL_SUM]], %[[LHS_CORR_SCALE]] : !torch.vtensor<[2],si32>, !torch.int -> !torch.vtensor<[2],si32>
+// CHECK:           %[[RESULT:.*]] = torch.aten.add.Tensor %[[MM]], %[[LHS_CORR]], %[[C1]] : !torch.vtensor<[4,2],si32>, !torch.vtensor<[2],si32>, !torch.int -> !torch.vtensor<[4,2],si32>
+// CHECK:           return %[[RESULT]] : !torch.vtensor<[4,2],si32>
+func.func @onnx_matmul_integer_uint8_lhs_int8_rhs(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[],si8>) -> !torch.vtensor<[4,2],si32> {
+  %0 = torch.onnx.matmul_integer %arg0, %arg1, %arg2, %arg3 : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],si8> -> !torch.vtensor<[4,2],si32>
+  return %0 : !torch.vtensor<[4,2],si32>
+}

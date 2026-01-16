@@ -1442,4 +1442,36 @@ def Torch_OnnxVariantRotaryEmbeddingOp: Torch_Op<"onnx.rotary_embedding", [
   let hasCustomAssemblyFormat = 1;
 }
 
+// This op corresponds to ONNX's MatMulInteger operator.
+// Ref: https://onnx.ai/onnx/operators/onnx__MatMulInteger.html
+def Torch_OnnxMatmulIntegerOp: Torch_Op<"onnx.matmul_integer", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "`matmul_integer op : (Tensor, Tensor, Tensor?, Tensor?) -> (Tensor)`";
+  let description = [{
+    The `torch.onnx.matmul_integer` operation performs integer matrix
+    multiplication following ONNX MatMulInteger semantics.
+
+    Computes: Y = (A - a_zero_point) @ (B - b_zero_point) -> int32
+
+    For UINT8 inputs, uses XOR with 0x80 to convert to INT8, then applies
+    correction terms. Zero points are optional. If not provided, assumed to be 0.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$lhs,
+    AnyTorchTensorType:$rhs,
+    AnyTorchOptionalTensorType:$lhs_zero_point,
+    AnyTorchOptionalTensorType:$rhs_zero_point
+  );
+  let results = (outs
+    AnyTorchTensorType:$result
+  );
+  let assemblyFormat = [{
+    $lhs `,` $rhs `,` $lhs_zero_point `,` $rhs_zero_point attr-dict
+    `:` type($lhs) `,` type($rhs) `,` type($lhs_zero_point) `,` type($rhs_zero_point) `->` type($result)
+  }];
+}
+
 #endif // TORCH_OPS
