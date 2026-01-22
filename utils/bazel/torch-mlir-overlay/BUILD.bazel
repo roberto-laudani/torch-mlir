@@ -2,7 +2,6 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-load("@com_github_bazelbuild_buildtools//buildifier:def.bzl", "buildifier")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
 
 package(
@@ -10,14 +9,6 @@ package(
         "//visibility:public",
     ],
 )
-
-# Format bazel BUILD and .bzl files with a standard convention
-# Invoke as `bazel run @torch-mlir//:buildifier`
-buildifier(
-    name = "buildifier",
-)
-
-exports_files(glob(["python/torch_mlir/extras/*"]))
 
 # Torch Dialect/IR
 td_library(
@@ -293,6 +284,16 @@ gentbl_cc_library(
     ],
 )
 
+cc_library(
+    name = "TorchMLIRConversionPassHeaders",
+    hdrs = ["include/torch-mlir/Conversion/Passes.h"],
+    strip_include_prefix = "include",
+    deps = [
+        ":TorchMLIRConversionPassesIncGen",
+        "@llvm-project//mlir:Pass",
+    ],
+)
+
 td_library(
     name = "TorchMLIRConversionTorchOnnxToTorchPassTdFiles",
     srcs = [
@@ -381,7 +382,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -407,7 +408,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
         "@llvm-project//mlir:ArithDialect",
@@ -433,7 +434,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -454,7 +455,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -479,7 +480,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -500,7 +501,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTMTensorDialect",
         ":TorchMLIRTorchBackendTypeConversion",
@@ -524,7 +525,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",
@@ -602,6 +603,7 @@ cc_library(
         ":TorchMLIRTorchToTMTensor",
         ":TorchMLIRTorchToTensor",
         #       ":TorchMLIRTorchToTosa",
+        "@llvm-project//mlir:ControlFlowTransforms",
         "@llvm-project//mlir:ConversionPasses",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:LinalgDialect",
@@ -627,7 +629,7 @@ cc_library(
     ],
     strip_include_prefix = "include",
     deps = [
-        ":TorchMLIRConversionPassesIncGen",
+        ":TorchMLIRConversionPassHeaders",
         ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchBackendTypeConversion",
         ":TorchMLIRTorchConversionDialect",

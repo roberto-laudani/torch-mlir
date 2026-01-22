@@ -1829,7 +1829,8 @@ public:
       // Use lower-right aligned causal mask to correctly handle KV cache
       // scenarios where Q_len < K_len (decode with past states).
       // Standard (upper-left) mask uses: i >= j
-      // Lower-right aligned uses: (i + offset) >= j, where offset = K_len - Q_len
+      // Lower-right aligned uses: (i + offset) >= j, where offset = K_len -
+      // Q_len
 
       // Mask tensor has shape [batch, heads, Q_len, K_len]
       // Q_len is at rank-2, K_len is at rank-1
@@ -1854,8 +1855,8 @@ public:
 
             // Lower-right alignment: (i + offset) >= j
             Value adjustedI = arith::AddIOp::create(b, loc, i, offset);
-            Value cond = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::sge,
-                                               adjustedI, j);
+            Value cond = arith::CmpIOp::create(
+                b, loc, arith::CmpIPredicate::sge, adjustedI, j);
             Value select = arith::SelectOp::create(b, loc, cond, zero, negInf);
             linalg::YieldOp::create(b, loc, select);
           });
@@ -1923,14 +1924,37 @@ public:
       }
     }
 
+    // Verify the scale matches the expected 1/sqrt(headDim).
+    // See:
+    // https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
     auto scaleAttr = mlir::FloatAttr{};
     if (!isa<Torch::NoneType>(scale.getType())) {
       double scaleFloat;
-      if (!matchPattern(scale, m_TorchConstantFloat(&scaleFloat))) {
-        return rewriter.notifyMatchFailure(loc,
-                                           "only constant scale supported");
-      }
+      if (!matchPattern(scale, m_TorchConstantFloat(&scaleFloat)))
+        return rewriter.notifyMatchFailure(loc, "scale must be a constant");
       scaleAttr = rewriter.getF64FloatAttr(scaleFloat);
+
+      int64_t headDim = queryTy.getDimSize(queryTy.getRank() - 1);
+      if (headDim == ShapedType::kDynamic) {
+        // With dynamic head dimension, we cannot verify the scale matches
+        // 1/sqrt(headDim).
+        return rewriter.notifyMatchFailure(
+            loc, "cannot verify scale with dynamic head dimension; use "
+                 "scale=None or use static head dimension");
+      }
+      double expectedScale = 1.0 / std::sqrt(static_cast<double>(headDim));
+      // Use relative tolerance for floating point comparison to handle
+      // varying magnitudes across different head dimensions consistently.
+      // 1e-6 relative tolerance is ~10x float32 machine epsilon, which
+      // provides a safe margin for:
+      // - Different computation orders (a*b vs b*a can differ slightly)
+      // - Float64 -> float32 -> float64 round-trips through serialization
+      double relativeError =
+          std::abs(scaleFloat - expectedScale) / expectedScale;
+      if (relativeError > 1e-6) {
+        return rewriter.notifyMatchFailure(
+            loc, "scale must be None or 1/sqrt(headDim)");
+      }
     }
 
     if (queryTy.getRank() != valueTy.getRank() ||

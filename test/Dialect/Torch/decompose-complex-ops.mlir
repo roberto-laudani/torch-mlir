@@ -18,10 +18,26 @@ func.func @matmul_decompose_2d(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.v
 }
 
 // -----
-// CHECK-LABEL:   func.func @matmul_decompose_3d(
-// CHECK:           torch.aten.bmm %arg0, %arg1 : !torch.vtensor<[?,?,?],f32>, !torch.vtensor<[?,?,?],f32> -> !torch.tensor
-func.func @matmul_decompose_3d(%arg0: !torch.vtensor<[?,?,?],f32>, %arg1: !torch.vtensor<[?,?,?],f32>) -> !torch.tensor {
+// CHECK-LABEL:   func.func @matmul_no_decompose_3d_dynamic(
+// CHECK:           torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[?,?,?],f32>, !torch.vtensor<[?,?,?],f32> -> !torch.tensor
+func.func @matmul_no_decompose_3d_dynamic(%arg0: !torch.vtensor<[?,?,?],f32>, %arg1: !torch.vtensor<[?,?,?],f32>) -> !torch.tensor {
   %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[?,?,?],f32>, !torch.vtensor<[?,?,?],f32> -> !torch.tensor
+  return %0 : !torch.tensor
+}
+
+// -----
+// CHECK-LABEL:   func.func @matmul_decompose_3d_static(
+// CHECK:           torch.aten.bmm %arg0, %arg1 : !torch.vtensor<[4,?,?],f32>, !torch.vtensor<[4,?,?],f32> -> !torch.tensor
+func.func @matmul_decompose_3d_static(%arg0: !torch.vtensor<[4,?,?],f32>, %arg1: !torch.vtensor<[4,?,?],f32>) -> !torch.tensor {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[4,?,?],f32>, !torch.vtensor<[4,?,?],f32> -> !torch.tensor
+  return %0 : !torch.tensor
+}
+
+// -----
+// CHECK-LABEL:   func.func @matmul_no_decompose_3d_broadcast(
+// CHECK:           torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[4,?,?],f32>, !torch.vtensor<[1,?,?],f32> -> !torch.tensor
+func.func @matmul_no_decompose_3d_broadcast(%arg0: !torch.vtensor<[4,?,?],f32>, %arg1: !torch.vtensor<[1,?,?],f32>) -> !torch.tensor {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[4,?,?],f32>, !torch.vtensor<[1,?,?],f32> -> !torch.tensor
   return %0 : !torch.tensor
 }
 
@@ -197,6 +213,69 @@ func.func @torch.aten.fft_rfft$2d_last_dim(%arg0: !torch.vtensor<[16,9],f32>) ->
   %none = torch.constant.none
   %out = torch.aten.fft_rfft %arg0, %none, %int-1, %none : !torch.vtensor<[16,9],f32>, !torch.none, !torch.int, !torch.none -> !torch.vtensor<[16,5],complex<f32>>
   return %out : !torch.vtensor<[16,5],complex<f32>>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @sdpa_decomposes_single_head(
+// CHECK:         %[[KEY_T:.*]] = torch.aten.transpose.int %arg1
+// CHECK:         %[[KEY_VIEW:.*]] = torch.aten.view %[[KEY_T]]
+// CHECK:         %[[SCORES:.*]] = torch.aten.bmm %arg0, %[[KEY_VIEW]]
+// CHECK:         %[[SCORES_VIEW:.*]] = torch.aten.view %[[SCORES]]
+// CHECK:         %[[SCALED:.*]] = torch.aten.mul.Scalar %[[SCORES_VIEW]]
+// CHECK:         %[[MAX:.*]], %[[INDICES:.*]] = torch.aten.max.dim %[[SCALED]]
+// CHECK:         %[[CENTERED:.*]] = torch.aten.sub.Tensor %[[SCALED]], %[[MAX]]
+// CHECK:         %[[EXP:.*]] = torch.aten.exp %[[CENTERED]]
+// CHECK:         %[[SUM_DIM:.*]] = torch.prim.ListConstruct
+// CHECK:         %[[DENOM:.*]] = torch.aten.sum.dim_IntList %[[EXP]], %[[SUM_DIM]]
+// CHECK:         %[[SOFTMAX:.*]] = torch.aten.div.Tensor %[[EXP]], %[[DENOM]]
+// CHECK:         %[[RESULT:.*]] = torch.aten.bmm %[[SOFTMAX]], %arg2
+// CHECK:         return %[[RESULT]] : !torch.vtensor<[1,4,8],f32>
+func.func @sdpa_decomposes_single_head(
+    %query: !torch.vtensor<[1,4,8],f32>,
+    %key: !torch.vtensor<[1,4,8],f32>,
+    %value: !torch.vtensor<[1,4,8],f32>) -> !torch.vtensor<[1,4,8],f32> {
+  %none = torch.constant.none
+  %zero = torch.constant.float 0.000000e+00
+  %false = torch.constant.bool false
+  %result = torch.aten.scaled_dot_product_attention %query, %key, %value, %none, %zero, %false, %none, %false :
+    !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[1,4,8],f32>, !torch.none, !torch.float, !torch.bool, !torch.none, !torch.bool -> !torch.vtensor<[1,4,8],f32>
+  return %result : !torch.vtensor<[1,4,8],f32>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @sdpa_keeps_mask(
+// CHECK:         torch.aten.scaled_dot_product_attention %arg0, %arg1, %arg2, %[[MASK:.*]]
+// CHECK:         return %[[RES:.*]] : !torch.vtensor<[1,4,8],f32>
+func.func @sdpa_keeps_mask(
+    %query: !torch.vtensor<[1,4,8],f32>,
+    %key: !torch.vtensor<[1,4,8],f32>,
+    %value: !torch.vtensor<[1,4,8],f32>) -> !torch.vtensor<[1,4,8],f32> {
+  %mask = torch.vtensor.literal(dense<0.0> : tensor<1x4x4xf32>) : !torch.vtensor<[1,4,4],f32>
+  %zero = torch.constant.float 0.000000e+00
+  %false = torch.constant.bool false
+  %none = torch.constant.none
+  %result = torch.aten.scaled_dot_product_attention %query, %key, %value, %mask, %zero, %false, %none, %false :
+    !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[1,4,4],f32>, !torch.float, !torch.bool, !torch.none, !torch.bool -> !torch.vtensor<[1,4,8],f32>
+  return %result : !torch.vtensor<[1,4,8],f32>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @sdpa_keeps_dropout(
+// CHECK:         torch.aten.scaled_dot_product_attention %arg0, %arg1, %arg2, %[[NONE:.*]], %[[P:.*]]
+// CHECK:         return %[[RES:.*]] : !torch.vtensor<[1,4,8],f32>
+func.func @sdpa_keeps_dropout(
+    %query: !torch.vtensor<[1,4,8],f32>,
+    %key: !torch.vtensor<[1,4,8],f32>,
+    %value: !torch.vtensor<[1,4,8],f32>) -> !torch.vtensor<[1,4,8],f32> {
+  %none = torch.constant.none
+  %p = torch.constant.float 1.000000e-01
+  %false = torch.constant.bool false
+  %result = torch.aten.scaled_dot_product_attention %query, %key, %value, %none, %p, %false, %none, %false :
+    !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[1,4,8],f32>, !torch.none, !torch.float, !torch.bool, !torch.none, !torch.bool -> !torch.vtensor<[1,4,8],f32>
+  return %result : !torch.vtensor<[1,4,8],f32>
 }
 
 // -----
