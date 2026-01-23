@@ -294,6 +294,130 @@ public:
   }
 };
 
+// Holds extracted quantization parameters from a quantized tensor operand.
+struct QuantizedOperandInfo {
+  Value intTensor;
+  Value zeroPoint;
+  Value scale;
+  bool isPerChannel = false;
+};
+
+// Extracts quantization info by looking through a dequantize op to find the
+// underlying quantized tensor. Returns nullopt if the chain is not found.
+static std::optional<QuantizedOperandInfo>
+extractQuantizationInfo(Value operand) {
+  // Look through dequantize op to find the quantized tensor
+  Operation *op = operand.getDefiningOp();
+  if (!op)
+    return std::nullopt;
+
+  if (!isa<AtenDequantizeSelfOp, AtenDequantizeTensorOp>(op))
+    return std::nullopt;
+
+  Value quantizedTensor = op->getOperand(0);
+
+  if (auto perTensorOp =
+          quantizedTensor.getDefiningOp<Aten_MakePerTensorQuantizedTensorOp>()) {
+    return QuantizedOperandInfo{perTensorOp.getSelf(),
+                                perTensorOp.getZeroPoint(),
+                                perTensorOp.getScale(), /*isPerChannel=*/false};
+  }
+  if (auto perChannelOp =
+          quantizedTensor
+              .getDefiningOp<Aten_MakePerChannelQuantizedTensorOp>()) {
+    return QuantizedOperandInfo{perChannelOp.getSelf(),
+                                perChannelOp.getZeroPoint(),
+                                perChannelOp.getScale(), /*isPerChannel=*/true};
+  }
+  return std::nullopt;
+}
+
+// Converts a scalar zero point to a rank-0 tensor if needed.
+// QuantizedMatmulOp expects tensor zero points.
+static Value createZeroPointTensor(PatternRewriter &rewriter, Location loc,
+                                   Value zeroPoint, Type intDtype) {
+  if (isa<ValueTensorType>(zeroPoint.getType()))
+    return zeroPoint;
+
+  auto tensorType =
+      rewriter.getType<ValueTensorType>(ArrayRef<int64_t>{}, intDtype);
+  return PrimNumToTensorScalarOp::create(rewriter, loc, tensorType, zeroPoint);
+}
+
+// Multiplies a tensor by a scale factor, handling both tensor and scalar
+// scales.
+static Value multiplyByScale(PatternRewriter &rewriter, Location loc,
+                             ValueTensorType resultType, Value tensor,
+                             Value scale) {
+  if (isa<ValueTensorType>(scale.getType()))
+    return AtenMulTensorOp::create(rewriter, loc, resultType, tensor, scale);
+  return AtenMulScalarOp::create(rewriter, loc, resultType, tensor, scale);
+}
+
+// Pattern to convert quantized matmul to quantized_matmul.
+// This handles the case where at least one operand is per-channel quantized,
+// which can't be handled by QuantizeAccumulator (per-tensor only).
+// Lowers to QuantizedMatmulOp which has proper decomposition support
+// for mixed signed/unsigned and asymmetric quantization.
+template <typename SrcOp>
+class QuantizedMatmulToQuantizedMatmul : public OpRewritePattern<SrcOp> {
+public:
+  using OpRewritePattern<SrcOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(SrcOp op,
+                                PatternRewriter &rewriter) const override {
+    auto lhsInfo = extractQuantizationInfo(op.getOperand(0));
+    auto rhsInfo = extractQuantizationInfo(op.getOperand(1));
+
+    if (!lhsInfo || !rhsInfo)
+      return failure();
+
+    // Only handle cases with at least one per-channel operand.
+    // Pure per-tensor cases are handled by QuantizeAccumulator.
+    if (!lhsInfo->isPerChannel && !rhsInfo->isPerChannel)
+      return failure();
+
+    auto resultType = cast<ValueTensorType>(op.getType());
+    if (!resultType.hasDtype() ||
+        !isa<mlir::FloatType>(resultType.getDtype()))
+      return failure();
+
+    Location loc = op.getLoc();
+
+    auto lhsIntType = cast<ValueTensorType>(lhsInfo->intTensor.getType());
+    auto rhsIntType = cast<ValueTensorType>(rhsInfo->intTensor.getType());
+
+    Value lhsZeroPointTensor = createZeroPointTensor(
+        rewriter, loc, lhsInfo->zeroPoint, lhsIntType.getDtype());
+    Value rhsZeroPointTensor = createZeroPointTensor(
+        rewriter, loc, rhsInfo->zeroPoint, rhsIntType.getDtype());
+
+    auto int32Type = rewriter.getIntegerType(32, /*isSigned=*/true);
+    auto intResultType = rewriter.getType<ValueTensorType>(
+        resultType.getOptionalSizes(), int32Type);
+
+    Value intResult = QuantizedMatmulOp::create(
+        rewriter, loc, intResultType, lhsInfo->intTensor, rhsInfo->intTensor,
+        lhsZeroPointTensor, rhsZeroPointTensor);
+
+    Value floatResult = AtenToDtypeOp::create(
+        rewriter, loc, resultType, intResult,
+        getDtypeIntValueForType(rewriter, loc, resultType.getDtype()),
+        /*non_blocking=*/ConstantBoolOp::create(rewriter, loc, false),
+        /*copy=*/ConstantBoolOp::create(rewriter, loc, false),
+        /*memory_format=*/ConstantNoneOp::create(rewriter, loc));
+
+    // Dequantize: result = int_result * lhs_scale * rhs_scale
+    floatResult = multiplyByScale(rewriter, loc, resultType, floatResult,
+                                  lhsInfo->scale);
+    floatResult = multiplyByScale(rewriter, loc, resultType, floatResult,
+                                  rhsInfo->scale);
+
+    rewriter.replaceOp(op, floatResult);
+    return success();
+  }
+};
+
 template <typename SrcOp>
 class QuantizeAccumulator : public OpRewritePattern<SrcOp> {
 public:
@@ -451,16 +575,20 @@ public:
     patterns.insert<
         RemoveUnused<AtenDequantizeSelfOp>,
         RemoveUnused<AtenDequantizeTensorOp>,
+        RemoveUnused<AtenIntReprOp>,
         RemoveUnused<AtenQuantizePerTensorOp>,
         RemoveUnused<Aten_MakePerTensorQuantizedTensorOp>,
         RemoveUnused<AtenTransposeIntOp>, RemoveUnused<AtenSliceTensorOp>,
         RemoveUnused<AtenReshapeOp>, RemoveUnused<PrimsCollapseOp>,
         RemoveUnused<AtenViewOp>, RemoveUnused<AtenPadOp>,
         RemoveUnused<AtenConstantPadNdOp>,
+
         QuantizeOperandsPastCommutingOps<AtenConvolutionOp, 5>,
         QuantizeOperandsPastCommutingOps<AtenReluOp, 0>,
         QuantizeOperandsPastCommutingOps<AtenMatmulOp, 2>,
         QuantizeOperandsPastCommutingOps<AtenMmOp, 4>,
+        QuantizedMatmulToQuantizedMatmul<AtenMmOp>,
+        QuantizedMatmulToQuantizedMatmul<AtenMatmulOp>,
         QuantizeAccumulator<AtenMmOp>, QuantizeAccumulator<AtenMatmulOp>,
         QuantizeResultLikeOperand<AtenReluOp>, QuantizeBias<AtenConvolutionOp>>(
         context);

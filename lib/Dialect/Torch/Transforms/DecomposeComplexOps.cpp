@@ -13049,7 +13049,7 @@ public:
   }
 };
 
-// Decompose torch.onnx.matmul_integer to primitive Torch ops.
+// Decompose torch.quantized_matmul to primitive Torch ops.
 // For UINT8 inputs (asymmetric quantization), we use the XOR approach:
 //   1. XOR UINT8 with 0x80 to convert to INT8 representation
 //      A' = A XOR 0x80  =>  A' (as INT8) = A_uint8 - 128
@@ -13153,11 +13153,11 @@ static Value addSumCorrection(PatternRewriter &rewriter, Location loc,
                                  alphaInt);
 }
 
-class DecomposeOnnxMatmulIntegerOp
-    : public OpRewritePattern<OnnxMatmulIntegerOp> {
+class DecomposeQuantizedMatmulOp
+    : public OpRewritePattern<QuantizedMatmulOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
-  LogicalResult matchAndRewrite(OnnxMatmulIntegerOp op,
+  LogicalResult matchAndRewrite(QuantizedMatmulOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     Value lhs = op.getLhs();
@@ -13571,7 +13571,7 @@ public:
     addPatternIfTargetOpIsIllegal<DecomposeAten_AssertScalarOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenRoundDecimalsOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenAsStridedOp>(patterns);
-    addPatternIfTargetOpIsIllegal<DecomposeOnnxMatmulIntegerOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeQuantizedMatmulOp>(patterns);
 
     GreedyRewriteConfig config;
     config.setUseTopDownTraversal(true);

@@ -1444,14 +1444,14 @@ def Torch_OnnxVariantRotaryEmbeddingOp: Torch_Op<"onnx.rotary_embedding", [
 
 // This op corresponds to ONNX's MatMulInteger operator.
 // Ref: https://onnx.ai/onnx/operators/onnx__MatMulInteger.html
-def Torch_OnnxMatmulIntegerOp: Torch_Op<"onnx.matmul_integer", [
+def Torch_QuantizedMatmulOp: Torch_Op<"quantized_matmul", [
     AllowsTypeRefinement,
     HasValueSemantics,
     ReadOnly
   ]> {
-  let summary = "`matmul_integer op : (Tensor, Tensor, Tensor?, Tensor?) -> (Tensor)`";
+  let summary = "`quantized_matmul op : (Tensor, Tensor, Tensor?, Tensor?) -> (Tensor)`";
   let description = [{
-    The `torch.onnx.matmul_integer` operation performs integer matrix
+    The `torch.quantized_matmul` operation performs integer matrix
     multiplication following ONNX MatMulInteger semantics.
 
     Computes: Y = (A - a_zero_point) @ (B - b_zero_point) -> int32

@@ -190,3 +190,106 @@ func.func @convolution_nobias(%arg0: !torch.vtensor<[1,3,8,8],si8>, %arg1: !torc
   // CHECK: %[[FOUT:.+]] = torch.aten.dequantize.tensor %[[QOUT]] : !torch.vtensor<[1,3,7,7],!torch.qint32> -> !torch.vtensor<[1,3,7,7],f32>
   return %16 : !torch.vtensor<[1,3,7,7],f32>
 }
+
+// -----
+
+// Test fusion with per-channel quantized weight (common in ONNX models)
+// This should lower to torch.quantized_matmul which handles mixed quantization properly.
+// CHECK-LABEL: @mm_per_channel_weight
+func.func @mm_per_channel_weight(%arg0: !torch.vtensor<[4,4],si8>, %arg1: !torch.vtensor<[4,4],si8>, %arg2: !torch.vtensor<[4],f32>, %arg3: !torch.vtensor<[4],si8>) -> !torch.vtensor<[4,4],f32> {
+  %scale = torch.constant.float 0.5
+  %zero = torch.constant.int 0
+  %axis = torch.constant.int 1
+  // Per-tensor quantized input
+  %0 = torch.aten._make_per_tensor_quantized_tensor %arg0, %scale, %zero : !torch.vtensor<[4,4],si8>, !torch.float, !torch.int -> !torch.vtensor<[4,4],!torch.qint8>
+  %1 = torch.aten.dequantize.self %0 : !torch.vtensor<[4,4],!torch.qint8> -> !torch.vtensor<[4,4],f32>
+  // Per-channel quantized weight
+  %2 = torch.aten._make_per_channel_quantized_tensor %arg1, %arg2, %arg3, %axis : !torch.vtensor<[4,4],si8>, !torch.vtensor<[4],f32>, !torch.vtensor<[4],si8>, !torch.int -> !torch.vtensor<[4,4],!torch.qint8>
+  %3 = torch.aten.dequantize.self %2 : !torch.vtensor<[4,4],!torch.qint8> -> !torch.vtensor<[4,4],f32>
+  %4 = torch.aten.mm %1, %3 : !torch.vtensor<[4,4],f32>, !torch.vtensor<[4,4],f32> -> !torch.vtensor<[4,4],f32>
+  // CHECK: torch.quantized_matmul %arg0, %arg1, %{{.*}}, %arg3 : !torch.vtensor<[4,4],si8>, !torch.vtensor<[4,4],si8>, !torch.vtensor<[],si8>, !torch.vtensor<[4],si8> -> !torch.vtensor<[4,4],si32>
+  // CHECK: torch.aten.to.dtype
+  // CHECK: torch.aten.mul.Scalar %{{.*}}, %{{.*}} : !torch.vtensor<[4,4],f32>, !torch.float
+  // CHECK: torch.aten.mul.Tensor %{{.*}}, %arg2 : !torch.vtensor<[4,4],f32>, !torch.vtensor<[4],f32>
+  return %4 : !torch.vtensor<[4,4],f32>
+}
+
+// -----
+
+// Test matmul with quint8 input (unsigned) and qint8 per-channel weight (signed).
+// This is a common pattern in ONNX quantized models (e.g., Qwen).
+// CHECK-LABEL: @matmul_quint8_input_qint8_per_channel_weight
+func.func @matmul_quint8_input_qint8_per_channel_weight(
+    %arg0: !torch.vtensor<[1,4,8],ui8>,
+    %arg1: !torch.vtensor<[8,16],si8>,
+    %arg2: !torch.vtensor<[16],f32>,
+    %arg3: !torch.vtensor<[16],si8>) -> !torch.vtensor<[1,4,16],f32> {
+  %input_scale = torch.constant.float 0.1
+  %input_zp = torch.constant.int 128
+  %axis = torch.constant.int 1
+  // Per-tensor quantized unsigned input
+  %0 = torch.aten._make_per_tensor_quantized_tensor %arg0, %input_scale, %input_zp : !torch.vtensor<[1,4,8],ui8>, !torch.float, !torch.int -> !torch.vtensor<[1,4,8],!torch.quint8>
+  %1 = torch.aten.dequantize.self %0 : !torch.vtensor<[1,4,8],!torch.quint8> -> !torch.vtensor<[1,4,8],f32>
+  // Per-channel quantized signed weight
+  %2 = torch.aten._make_per_channel_quantized_tensor %arg1, %arg2, %arg3, %axis : !torch.vtensor<[8,16],si8>, !torch.vtensor<[16],f32>, !torch.vtensor<[16],si8>, !torch.int -> !torch.vtensor<[8,16],!torch.qint8>
+  %3 = torch.aten.dequantize.self %2 : !torch.vtensor<[8,16],!torch.qint8> -> !torch.vtensor<[8,16],f32>
+  %4 = torch.aten.matmul %1, %3 : !torch.vtensor<[1,4,8],f32>, !torch.vtensor<[8,16],f32> -> !torch.vtensor<[1,4,16],f32>
+  // CHECK: torch.quantized_matmul %arg0, %arg1, %{{.*}}, %arg3 : !torch.vtensor<[1,4,8],ui8>, !torch.vtensor<[8,16],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[16],si8> -> !torch.vtensor<[1,4,16],si32>
+  // CHECK: torch.aten.to.dtype
+  // CHECK: torch.aten.mul.Scalar
+  // CHECK: torch.aten.mul.Tensor
+  return %4 : !torch.vtensor<[1,4,16],f32>
+}
+
+// -----
+
+// Test matmul with both operands being per-channel quantized.
+// CHECK-LABEL: @matmul_both_per_channel
+func.func @matmul_both_per_channel(
+    %arg0: !torch.vtensor<[4,8],si8>,
+    %arg1: !torch.vtensor<[8,16],si8>,
+    %arg2: !torch.vtensor<[8],f32>,
+    %arg3: !torch.vtensor<[8],si8>,
+    %arg4: !torch.vtensor<[16],f32>,
+    %arg5: !torch.vtensor<[16],si8>) -> !torch.vtensor<[4,16],f32> {
+  %axis0 = torch.constant.int 1
+  %axis1 = torch.constant.int 1
+  // Per-channel quantized input
+  %0 = torch.aten._make_per_channel_quantized_tensor %arg0, %arg2, %arg3, %axis0 : !torch.vtensor<[4,8],si8>, !torch.vtensor<[8],f32>, !torch.vtensor<[8],si8>, !torch.int -> !torch.vtensor<[4,8],!torch.qint8>
+  %1 = torch.aten.dequantize.self %0 : !torch.vtensor<[4,8],!torch.qint8> -> !torch.vtensor<[4,8],f32>
+  // Per-channel quantized weight
+  %2 = torch.aten._make_per_channel_quantized_tensor %arg1, %arg4, %arg5, %axis1 : !torch.vtensor<[8,16],si8>, !torch.vtensor<[16],f32>, !torch.vtensor<[16],si8>, !torch.int -> !torch.vtensor<[8,16],!torch.qint8>
+  %3 = torch.aten.dequantize.self %2 : !torch.vtensor<[8,16],!torch.qint8> -> !torch.vtensor<[8,16],f32>
+  %4 = torch.aten.matmul %1, %3 : !torch.vtensor<[4,8],f32>, !torch.vtensor<[8,16],f32> -> !torch.vtensor<[4,16],f32>
+  // CHECK: torch.quantized_matmul %arg0, %arg1, %arg3, %arg5 : !torch.vtensor<[4,8],si8>, !torch.vtensor<[8,16],si8>, !torch.vtensor<[8],si8>, !torch.vtensor<[16],si8> -> !torch.vtensor<[4,16],si32>
+  // CHECK: torch.aten.to.dtype
+  // CHECK: torch.aten.mul.Tensor {{.*}}, %arg2
+  // CHECK: torch.aten.mul.Tensor {{.*}}, %arg4
+  return %4 : !torch.vtensor<[4,16],f32>
+}
+
+// -----
+
+// Test mm (2D matmul) with quint8/qint8 mixed types.
+// CHECK-LABEL: @mm_quint8_qint8_mixed
+func.func @mm_quint8_qint8_mixed(
+    %arg0: !torch.vtensor<[4,8],ui8>,
+    %arg1: !torch.vtensor<[8,16],si8>,
+    %arg2: !torch.vtensor<[16],f32>,
+    %arg3: !torch.vtensor<[16],si8>) -> !torch.vtensor<[4,16],f32> {
+  %input_scale = torch.constant.float 0.05
+  %input_zp = torch.constant.int 127
+  %axis = torch.constant.int 1
+  // Per-tensor unsigned input
+  %0 = torch.aten._make_per_tensor_quantized_tensor %arg0, %input_scale, %input_zp : !torch.vtensor<[4,8],ui8>, !torch.float, !torch.int -> !torch.vtensor<[4,8],!torch.quint8>
+  %1 = torch.aten.dequantize.self %0 : !torch.vtensor<[4,8],!torch.quint8> -> !torch.vtensor<[4,8],f32>
+  // Per-channel signed weight
+  %2 = torch.aten._make_per_channel_quantized_tensor %arg1, %arg2, %arg3, %axis : !torch.vtensor<[8,16],si8>, !torch.vtensor<[16],f32>, !torch.vtensor<[16],si8>, !torch.int -> !torch.vtensor<[8,16],!torch.qint8>
+  %3 = torch.aten.dequantize.self %2 : !torch.vtensor<[8,16],!torch.qint8> -> !torch.vtensor<[8,16],f32>
+  %4 = torch.aten.mm %1, %3 : !torch.vtensor<[4,8],f32>, !torch.vtensor<[8,16],f32> -> !torch.vtensor<[4,16],f32>
+  // CHECK: torch.quantized_matmul %arg0, %arg1, %{{.*}}, %arg3 : !torch.vtensor<[4,8],ui8>, !torch.vtensor<[8,16],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[16],si8> -> !torch.vtensor<[4,16],si32>
+  // CHECK: torch.aten.to.dtype
+  // CHECK: torch.aten.mul.Scalar
+  // CHECK: torch.aten.mul.Tensor
+  return %4 : !torch.vtensor<[4,16],f32>
+}

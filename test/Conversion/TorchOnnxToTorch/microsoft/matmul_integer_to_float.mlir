@@ -1,10 +1,10 @@
 // RUN: torch-mlir-opt <%s --split-input-file -convert-torch-onnx-to-torch | FileCheck %s
 
-// CHECK-LABEL: @test_matmul_integer_to_float
+// CHECK-LABEL: @test_quantized_matmul_to_float
 // CHECK-SAME: %[[LHS:.+]]: !torch.vtensor<[4,3],ui8>, %[[RHS:.+]]: !torch.vtensor<[3,2],ui8>,
 // CHECK-SAME: %[[LHS_SCALE:.+]]: !torch.vtensor<[],f32>, %[[RHS_SCALE:.+]]: !torch.vtensor<[],f32>,
 // CHECK-SAME: %[[LHS_ZP:.+]]: !torch.vtensor<[],ui8>, %[[RHS_ZP:.+]]: !torch.vtensor<[],ui8>
-func.func @test_matmul_integer_to_float(
+func.func @test_quantized_matmul_to_float(
     %arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],ui8>,
     %arg2: !torch.vtensor<[],f32>, %arg3: !torch.vtensor<[],f32>,
     %arg4: !torch.vtensor<[],ui8>, %arg5: !torch.vtensor<[],ui8>) -> !torch.vtensor<[4,2],f32>
@@ -12,8 +12,8 @@ func.func @test_matmul_integer_to_float(
     torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 18 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""
   } {
   // CHECK-NOT: torch.operator "onnx.MatMulIntegerToFloat"
-  // Emit torch.onnx.matmul_integer op
-  // CHECK: %[[MATMUL_INT:.+]] = torch.onnx.matmul_integer %[[LHS]], %[[RHS]], %[[LHS_ZP]], %[[RHS_ZP]] : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],ui8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],ui8> -> !torch.vtensor<[4,2],si32>
+  // Emit torch.quantized_matmul op
+  // CHECK: %[[MATMUL_INT:.+]] = torch.quantized_matmul %[[LHS]], %[[RHS]], %[[LHS_ZP]], %[[RHS_ZP]] : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],ui8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],ui8> -> !torch.vtensor<[4,2],si32>
   // Convert to float
   // CHECK: %[[INT_RESULT:.+]] = torch.aten.to.dtype %[[MATMUL_INT]], %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[4,2],si32>{{.+}} -> !torch.vtensor<[4,2],f32>
   // Multiply scales
@@ -29,12 +29,12 @@ func.func @test_matmul_integer_to_float(
 
 // -----
 
-// CHECK-LABEL: @test_matmul_integer_to_float_with_bias
+// CHECK-LABEL: @test_quantized_matmul_to_float_with_bias
 // CHECK-SAME: %[[LHS:.+]]: !torch.vtensor<[4,3],ui8>, %[[RHS:.+]]: !torch.vtensor<[3,2],si8>,
 // CHECK-SAME: %[[LHS_SCALE:.+]]: !torch.vtensor<[],f32>, %[[RHS_SCALE:.+]]: !torch.vtensor<[],f32>,
 // CHECK-SAME: %[[LHS_ZP:.+]]: !torch.vtensor<[],ui8>, %[[RHS_ZP:.+]]: !torch.vtensor<[],si8>,
 // CHECK-SAME: %[[BIAS:.+]]: !torch.vtensor<[2],f32>
-func.func @test_matmul_integer_to_float_with_bias(
+func.func @test_quantized_matmul_to_float_with_bias(
     %arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],si8>,
     %arg2: !torch.vtensor<[],f32>, %arg3: !torch.vtensor<[],f32>,
     %arg4: !torch.vtensor<[],ui8>, %arg5: !torch.vtensor<[],si8>,
@@ -43,8 +43,8 @@ func.func @test_matmul_integer_to_float_with_bias(
     torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 18 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""
   } {
   // CHECK-NOT: torch.operator "onnx.MatMulIntegerToFloat"
-  // Emit torch.onnx.matmul_integer op
-  // CHECK: %[[MATMUL_INT:.+]] = torch.onnx.matmul_integer %[[LHS]], %[[RHS]], %[[LHS_ZP]], %[[RHS_ZP]] : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],si8> -> !torch.vtensor<[4,2],si32>
+  // Emit torch.quantized_matmul op
+  // CHECK: %[[MATMUL_INT:.+]] = torch.quantized_matmul %[[LHS]], %[[RHS]], %[[LHS_ZP]], %[[RHS_ZP]] : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],si8> -> !torch.vtensor<[4,2],si32>
   // Convert to float
   // CHECK: torch.aten.to.dtype %[[MATMUL_INT]], %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : !torch.vtensor<[4,2],si32>{{.+}} -> !torch.vtensor<[4,2],f32>
   // Multiply scales

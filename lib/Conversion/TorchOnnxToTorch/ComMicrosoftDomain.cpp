@@ -206,7 +206,7 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         //     -> fpType{dtype.float32, dtype.float16}
         //
         // Lowered to:
-        //   1. aten.onnx.matmul_integer
+        //   1. torch.quantized_matmul
         //   2. Convert to float
         //   3. Scale by lhs_scale * rhs_scale
         //   4. Add bias if present
@@ -229,12 +229,12 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         if (failed(binder.tensorOperandAtIndex(rhsZeroPoint, 5)))
           rhsZeroPoint = noneVal;
 
-        // Create torch.onnx.matmul_integer op
+        // Create torch.quantized_matmul op
         auto matMulIntTy = Torch::ValueTensorType::get(
             ctx, resultType.getSizes(),
             mlir::IntegerType::get(ctx, 32, mlir::IntegerType::Signed));
 
-        Value matMulInt = Torch::OnnxMatmulIntegerOp::create(
+        Value matMulInt = Torch::QuantizedMatmulOp::create(
             rewriter, loc, matMulIntTy, lhs, rhs, lhsZeroPoint, rhsZeroPoint);
 
         // Convert to float

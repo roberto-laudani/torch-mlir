@@ -555,7 +555,7 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
   patterns.onOp(
       "MatMulInteger", 10,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
-        // Emit torch.onnx.matmul_integer which will be decomposed later
+        // Emit torch.quantized_matmul which will be decomposed later
         Location loc = binder.getLoc();
         Torch::ValueTensorType resultType;
         Value lhs, rhs, lhsZp, rhsZp;
@@ -571,7 +571,7 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
         if (failed(binder.tensorOperandAtIndex(rhsZp, 3)))
           rhsZp = noneVal;
 
-        rewriter.replaceOpWithNewOp<Torch::OnnxMatmulIntegerOp>(
+        rewriter.replaceOpWithNewOp<Torch::QuantizedMatmulOp>(
             binder.op, resultType, lhs, rhs, lhsZp, rhsZp);
         return success();
       });
