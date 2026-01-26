@@ -10,6 +10,12 @@ package(
     ],
 )
 
+# Export Python files for downstream projects
+exports_files([
+    "python/torch_mlir/extras/fx_importer.py",
+    "python/torch_mlir/extras/onnx_importer.py",
+])
+
 # Torch Dialect/IR
 td_library(
     name = "MLIRTorchOpsIncGenTdFiles",
@@ -652,6 +658,7 @@ cc_library(
     deps = [
         ":TorchMLIRTorchConversionDialect",
         "@llvm-project//mlir:FuncTransforms",
+        "@llvm-project//mlir:TensorDialect",
     ],
 )
 
