@@ -1073,3 +1073,12 @@ func.func @onnx_quantized_matmul_uint8_lhs_int8_rhs(%arg0: !torch.vtensor<[4,3],
   %0 = torch.quantized_matmul %arg0, %arg1, %arg2, %arg3 : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],si8> -> !torch.vtensor<[4,2],si32>
   return %0 : !torch.vtensor<[4,2],si32>
 }
+
+// -----
+
+// CHECK-LABEL: @test_int_mm_basic
+// CHECK: torch.aten.mm %arg0, %arg1 : !torch.vtensor<[3,4],si8>, !torch.vtensor<[4,5],si8> -> !torch.vtensor<[3,5],si32>
+func.func @test_int_mm_basic(%arg0: !torch.vtensor<[3,4],si8>, %arg1: !torch.vtensor<[4,5],si8>) -> !torch.vtensor<[3,5],si32> {
+  %0 = torch.aten._int_mm %arg0, %arg1 : !torch.vtensor<[3,4],si8>, !torch.vtensor<[4,5],si8> -> !torch.vtensor<[3,5],si32>
+  return %0 : !torch.vtensor<[3,5],si32>
+}

@@ -1875,6 +1875,21 @@ public:
 };
 } // namespace
 
+// Decompose aten._int_mm to aten.mm
+namespace {
+class DecomposeAten_IntMmOp : public OpRewritePattern<Aten_IntMmOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(Aten_IntMmOp op,
+                                PatternRewriter &rewriter) const override {
+    Value lhs = op.getSelf();
+    Value rhs = op.getMat2();
+    rewriter.replaceOpWithNewOp<AtenMmOp>(op, op.getType(), lhs, rhs);
+    return success();
+  }
+};
+} // namespace
+
 namespace {
 class DecomposeAtenIsinfOp : public OpRewritePattern<AtenIsinfOp> {
 public:
@@ -13386,6 +13401,7 @@ public:
     addPatternIfTargetOpIsIllegal<DecomposeAtenEyeOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenEyeMOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenIsnanOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeAten_IntMmOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenIsinfOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenIsneginfOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenIsposinfOp>(patterns);
