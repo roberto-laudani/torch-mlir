@@ -6,6 +6,7 @@
 // Also available under a BSD-style license. See LICENSE.
 //
 //===----------------------------------------------------------------------===//
+#include "llvm/ADT/SmallVector.h"
 #define DEBUG_TYPE "torch-mlir-torch-dialect"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
@@ -235,6 +236,46 @@ static Value getScalarFloatValue(Value input, Location loc,
 }
 
 //===----------------------------------------------------------------------===//
+// HigherOrderFlexAttentionOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult HigherOrderFlexAttentionOp::verify() {
+  static constexpr int kAttentionRank = 4;
+  Value query = getQuery();
+  Value key = getKey();
+  Value value = getValue();
+
+  if (!isa<Torch::BoolType>(getReturnLse().getType())) {
+    return emitError() << "expected return_lse to be a bool type";
+  }
+  if (!isa<Torch::BoolType>(getReturnMaxScores().getType())) {
+    return emitError() << "expected return_max_scores to be a bool type";
+  }
+
+  auto queryType = dyn_cast<ValueTensorType>(query.getType());
+  auto keyType = dyn_cast<ValueTensorType>(key.getType());
+  auto valueType = dyn_cast<ValueTensorType>(value.getType());
+
+  if (!queryType || !keyType || !valueType || !queryType.hasSizes() ||
+      !keyType.hasSizes() || !valueType.hasSizes()) {
+    return emitError() << "expected input(s) types having sizes";
+  }
+
+  ArrayRef<int64_t> queryShape = queryType.getSizes();
+
+  // Query shape: [B, H, M, E].
+  if (queryShape.size() != kAttentionRank) {
+    return emitError() << "expected 4D query tensor";
+  }
+  // Check if the element type is a float.
+  if (!isa<mlir::FloatType>(queryType.getDtype())) {
+    return emitError() << "expected float element type";
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // MethodOp
 //===----------------------------------------------------------------------===//
 
@@ -382,12 +423,17 @@ void PrimLoopOp::getSuccessorRegions(
     RegionBranchPoint point, SmallVectorImpl<RegionSuccessor> &regions) {
   Region &region = getRegion();
   if (!point.getTerminatorPredecessorOrNull()) {
-    regions.emplace_back(&region, region.getArguments().slice(1));
+    regions.emplace_back(&region);
     return;
   }
   assert(point.getTerminatorPredecessorOrNull()->getParentRegion() == &region);
-  regions.emplace_back(&region, region.getArguments().slice(1));
-  regions.emplace_back(getOperation(), getResults());
+  regions.emplace_back(&region);
+  regions.emplace_back(RegionSuccessor::parent());
+}
+
+ValueRange PrimLoopOp::getSuccessorInputs(RegionSuccessor successor) {
+  return successor.isParent() ? ValueRange(getResults())
+                              : ValueRange(getRegion().getArguments().slice(1));
 }
 
 bool PrimLoopOp::isForLike() {
@@ -453,7 +499,7 @@ void PrimIfOp::getSuccessorRegions(RegionBranchPoint point,
                                    SmallVectorImpl<RegionSuccessor> &regions) {
   // The `then` and the `else` region branch back to the parent operation.
   if (point.getTerminatorPredecessorOrNull()) {
-    regions.push_back(RegionSuccessor(getOperation(), getResults()));
+    regions.push_back(RegionSuccessor::parent());
     return;
   }
 
@@ -469,6 +515,10 @@ void PrimIfOp::getSuccessorRegions(RegionBranchPoint point,
   regions.push_back(RegionSuccessor(&getThenRegion()));
   regions.push_back(RegionSuccessor(&getElseRegion()));
   return;
+}
+
+ValueRange PrimIfOp::getSuccessorInputs(RegionSuccessor successor) {
+  return successor.isParent() ? ValueRange(getResults()) : ValueRange();
 }
 
 /// Replaces the given op with the contents of the given single-block region,
@@ -2434,12 +2484,15 @@ void AtenUnflattenIntOp::getCanonicalizationPatterns(
                                          "sizes must come from list construct");
     if (sizeValues.size() != 2)
       return failure();
-    int64_t dim0, dim1;
+    int64_t dim0 = Torch::kUnknownSize;
+    int64_t dim1 = Torch::kUnknownSize;
     bool dim0Constant = matchPattern(sizeValues[0], m_TorchConstantInt(&dim0));
     bool dim1Constant = matchPattern(sizeValues[1], m_TorchConstantInt(&dim1));
     if (!dim0Constant && !dim1Constant)
       return failure();
-    if (dim0 != 1 && dim1 != 1)
+    bool dim0IsOne = dim0Constant && dim0 == 1;
+    bool dim1IsOne = dim1Constant && dim1 == 1;
+    if (!dim0IsOne && !dim1IsOne)
       return failure();
     Value unflattenDim = op.getDim();
     int64_t dimAsInt;
@@ -2450,7 +2503,7 @@ void AtenUnflattenIntOp::getCanonicalizationPatterns(
     // the runtime asserts below are introduced to catch malformed unflatten ops
     // possibly generated from onnx IR.
     Value unsqueeze;
-    if (dim0 == 1) {
+    if (dim0IsOne) {
       // unsqueeze at dim
       FailureOr<Value> maybeUnsqueeze =
           Torch::unsqueezeTensor(rewriter, op, self, unflattenDim);
@@ -2471,7 +2524,7 @@ void AtenUnflattenIntOp::getCanonicalizationPatterns(
           rewriter, op.getLoc(), isMOneOrSameSize,
           rewriter.getStringAttr("unflatten sizes must be compatible"));
     }
-    if (dim1 == 1) {
+    if (dim1IsOne) {
       // unsqueeze at dim + 1
       Value dimPlusOne;
       if (!dimWasConstant) {
@@ -5332,7 +5385,7 @@ getSuccessorRegionsForCalculateOp(CalculateOp op, RegionBranchPoint point,
   Region *region = point.getTerminatorPredecessorOrNull()->getParentRegion();
   if (region == &op.getBody()) {
     // Body returns control to the outer op, passing through results.
-    regions.emplace_back(op.getOperation(), op.getResults());
+    regions.emplace_back(RegionSuccessor::parent());
     return;
   }
   assert(region == &op.getCalculation());
@@ -5345,6 +5398,10 @@ void ShapeCalculateOp::getSuccessorRegions(
   getSuccessorRegionsForCalculateOp(*this, point, regions);
 }
 
+ValueRange ShapeCalculateOp::getSuccessorInputs(RegionSuccessor successor) {
+  return successor.isParent() ? ValueRange(getResults()) : ValueRange();
+}
+
 //===----------------------------------------------------------------------===//
 // DtypeCalculateOp
 //===----------------------------------------------------------------------===//
@@ -5352,6 +5409,10 @@ void ShapeCalculateOp::getSuccessorRegions(
 void DtypeCalculateOp::getSuccessorRegions(
     RegionBranchPoint point, SmallVectorImpl<RegionSuccessor> &regions) {
   getSuccessorRegionsForCalculateOp(*this, point, regions);
+}
+
+ValueRange DtypeCalculateOp::getSuccessorInputs(RegionSuccessor successor) {
+  return successor.isParent() ? ValueRange(getResults()) : ValueRange();
 }
 
 //===----------------------------------------------------------------------===//
@@ -5718,6 +5779,338 @@ void Aten_AdaptiveAvgPool2dOp::getCanonicalizationPatterns(
 
     return success();
   });
+}
+
+namespace {
+
+void expand(SmallVectorImpl<int64_t> &params, int numSpatialDims) {
+  if (params.size() == 1) {
+    for ([[maybe_unused]] int dim : llvm::seq<int>(0, numSpatialDims - 1)) {
+      params.push_back(params[0]);
+    }
+  }
+}
+
+template <typename AtenPoolOpT>
+LogicalResult expandPoolParams(AtenPoolOpT op, int numSpatialDims,
+                               mlir::PatternRewriter &rewriter,
+                               Value &kernelSizeList, Value &stridesList,
+                               Value &paddingList, Value &dilationsList) {
+
+  SmallVector<int64_t, 3> kernelSizeInts, strideInts, paddingInts, dilationInts;
+  if (!matchPattern(op.getKernelSize(),
+                    m_TorchListOfConstantInts(kernelSizeInts)))
+    return rewriter.notifyMatchFailure(
+        op, "Non-const kernel_size for pooling op unsupported");
+
+  if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(paddingInts)))
+    return rewriter.notifyMatchFailure(
+        op, "Non-const padding factor for pooling op unsupported");
+
+  if (!matchPattern(op.getStride(), m_TorchListOfConstantInts(strideInts)))
+    return rewriter.notifyMatchFailure(
+        op, "Non-const stride for pooling op unsupported");
+
+  if constexpr (std::is_same<AtenPoolOpT, AtenMaxPool2dOp>() ||
+                std::is_same<AtenPoolOpT, AtenMaxPool3dOp>()) {
+    if (!matchPattern(op.getDilation(),
+                      m_TorchListOfConstantInts(dilationInts)))
+      return rewriter.notifyMatchFailure(
+          op, "Non-const dilation for pooling op unsupported");
+
+    if (kernelSizeInts.size() != 1 && paddingInts.size() != 1 &&
+        strideInts.size() != 1 && dilationInts.size() != 1) {
+      return rewriter.notifyMatchFailure(
+          op,
+          "Expected one of kernel/stride/padding/dilation to be singleton.");
+    }
+
+    expand(dilationInts, numSpatialDims);
+
+  } else if (kernelSizeInts.size() != 1 && paddingInts.size() != 1 &&
+             strideInts.size() != 1) {
+    return rewriter.notifyMatchFailure(
+        op, "Expected one of kernel/stride/padding to be singleton.");
+  }
+
+  // expand singleton elements
+  expand(kernelSizeInts, numSpatialDims);
+  expand(paddingInts, numSpatialDims);
+  expand(strideInts, numSpatialDims);
+
+  Location loc = op.getLoc();
+
+  SmallVector<Value> cstKernel, cstPadding, cstStrides, cstDilations;
+  for (auto dim : llvm::seq<int>(0, kernelSizeInts.size())) {
+    cstKernel.push_back(Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(kernelSizeInts[dim])));
+    cstPadding.push_back(Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(paddingInts[dim])));
+    cstStrides.push_back(Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(strideInts[dim])));
+  }
+
+  // set dilations separately as for AvgPool op it won't be set
+  for (auto dim : llvm::seq<int>(0, dilationInts.size())) {
+    cstDilations.push_back(Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(dilationInts[dim])));
+  }
+
+  auto targetListType =
+      Torch::ListType::get(Torch::IntType::get(op->getContext()));
+  kernelSizeList = Torch::PrimListConstructOp::create(
+      rewriter, loc, targetListType, cstKernel);
+  paddingList = Torch::PrimListConstructOp::create(rewriter, loc,
+                                                   targetListType, cstPadding);
+  stridesList = Torch::PrimListConstructOp::create(rewriter, loc,
+                                                   targetListType, cstStrides);
+  dilationsList = Torch::PrimListConstructOp::create(
+      rewriter, loc, targetListType, cstDilations);
+
+  return success();
+}
+
+template <typename AvgPoolOpT>
+struct CanonicalizeAvgPoolWithSingleIntTuple
+    : public mlir::OpRewritePattern<AvgPoolOpT> {
+  CanonicalizeAvgPoolWithSingleIntTuple(mlir::MLIRContext *context)
+      : OpRewritePattern<AvgPoolOpT>(context, /*benefit=*/1) {}
+
+  LogicalResult
+  matchAndRewrite(AvgPoolOpT op,
+                  mlir::PatternRewriter &rewriter) const override {
+    Value kernel, stride, pad, dilations;
+
+    auto numSpatialDims = 2;
+    if constexpr (std::is_same<AvgPoolOpT, AtenAvgPool3dOp>())
+      numSpatialDims = 3;
+
+    // Attempt to expand params if necessary.
+    if (failed(expandPoolParams(op, numSpatialDims, rewriter, kernel, stride,
+                                pad, dilations)))
+      return rewriter.notifyMatchFailure(
+          op, "Failed to expand params for AvgPooling");
+
+    rewriter.replaceOpWithNewOp<AvgPoolOpT>(
+        op, op.getResult().getType(), op.getSelf(), kernel, stride, pad,
+        op.getCeilMode(), op.getCountIncludePad(), op.getDivisorOverride());
+    return success();
+  }
+};
+
+template <typename MaxPoolOpT>
+struct CanonicalizeMaxPoolWithSingleIntTuple
+    : public mlir::OpRewritePattern<MaxPoolOpT> {
+  CanonicalizeMaxPoolWithSingleIntTuple(mlir::MLIRContext *context)
+      : OpRewritePattern<MaxPoolOpT>(context, /*benefit=*/1) {}
+
+  LogicalResult
+  matchAndRewrite(MaxPoolOpT op,
+                  mlir::PatternRewriter &rewriter) const override {
+    Value kernel, stride, pad, dilations;
+
+    auto numSpatialDims = 2;
+    if constexpr (std::is_same<MaxPoolOpT, AtenMaxPool3dOp>())
+      numSpatialDims = 3;
+
+    // Attempt to expand params if necessary.
+    if (failed(expandPoolParams(op, numSpatialDims, rewriter, kernel, stride,
+                                pad, dilations)))
+      return rewriter.notifyMatchFailure(
+          op, "Failed to expand params for MaxPooling");
+
+    rewriter.replaceOpWithNewOp<MaxPoolOpT>(op, op.getResult().getType(),
+                                            op.getSelf(), kernel, stride, pad,
+                                            dilations, op.getCeilMode());
+    return success();
+  }
+};
+} // namespace
+
+//===----------------------------------------------------------------------===//
+// AtenAvgPool2dOp
+//===----------------------------------------------------------------------===//
+void AtenAvgPool2dOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                                  MLIRContext *context) {
+  patterns.add<CanonicalizeAvgPoolWithSingleIntTuple<AtenAvgPool2dOp>>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// AtenAvgPool3dOp
+//===----------------------------------------------------------------------===//
+void AtenAvgPool3dOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                                  MLIRContext *context) {
+  patterns.add<CanonicalizeAvgPoolWithSingleIntTuple<AtenAvgPool3dOp>>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// AtenMaxPool2dOp
+//===----------------------------------------------------------------------===//
+void AtenMaxPool2dOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                                  MLIRContext *context) {
+  patterns.add<CanonicalizeMaxPoolWithSingleIntTuple<AtenMaxPool2dOp>>(context);
+}
+
+//===----------------------------------------------------------------------===//
+// AtenMaxPool3dOp
+//===----------------------------------------------------------------------===//
+void AtenMaxPool3dOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
+                                                  MLIRContext *context) {
+  patterns.add<CanonicalizeMaxPoolWithSingleIntTuple<AtenMaxPool3dOp>>(context);
+}
+
+namespace {
+class CanonicalizeConvolutionWithSingleIntTuple
+    : public OpRewritePattern<AtenConvolutionOp> {
+public:
+  using OpRewritePattern<AtenConvolutionOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AtenConvolutionOp op,
+                                PatternRewriter &rewriter) const override {
+
+    auto weight = op.getWeight();
+    auto weightType = dyn_cast<ValueTensorType>(weight.getType());
+
+    if (!weightType) {
+      return rewriter.notifyMatchFailure(op, "weight is not a vtensor");
+    }
+    auto optionalSizes = weightType.getOptionalSizes();
+    if (!optionalSizes.has_value()) {
+      return rewriter.notifyMatchFailure(op,
+                                         "unranked weight tensor unsupported!");
+    }
+
+    // The rank is the size of the dimensions array
+    int64_t weightRank = optionalSizes.value().size();
+
+    // We canonicalize Rank 4 (2D Conv) or Rank 5 (3D Conv).
+    if (weightRank < 4 || weightRank > 5) {
+      return rewriter.notifyMatchFailure(
+          op, "unsupported weight rank (must be 4 or 5)");
+    }
+    int requiredSpatialDims = weightRank - 2;
+
+    // Validate stride, padding, output_padding, and dilation are constant
+    // lists.
+    SmallVector<int64_t, 3> strideInts;
+    if (!matchPattern(op.getStride(), m_TorchListOfConstantInts(strideInts))) {
+      return rewriter.notifyMatchFailure(op,
+                                         "non-const int stride unsupported!");
+    }
+    SmallVector<int64_t, 3> paddingInts;
+    if (!matchPattern(op.getPadding(),
+                      m_TorchListOfConstantInts(paddingInts))) {
+      return rewriter.notifyMatchFailure(op,
+                                         "non-const int padding unsupported!");
+    }
+
+    SmallVector<int64_t, 3> dilationInts;
+    if (!matchPattern(op.getDilation(),
+                      m_TorchListOfConstantInts(dilationInts))) {
+      return rewriter.notifyMatchFailure(op,
+                                         "non-const int dilation unsupported!");
+    }
+
+    bool transposed;
+    if (!matchPattern(op.getTransposed(), m_TorchConstantBool(&transposed))) {
+      return rewriter.notifyMatchFailure(
+          op, "non-const int tranposed unsupported!");
+    }
+
+    SmallVector<int64_t, 3> outputPaddingInts;
+    if (!matchPattern(op.getOutputPadding(),
+                      m_TorchListOfConstantInts(outputPaddingInts))) {
+      return rewriter.notifyMatchFailure(
+          op, "non-const int output_padding unsupported!");
+    }
+
+    // Canonicalization Logic: Only rewrite if convolution attribute provided is
+    // 1 element but the convolution requires 2 or 3 elements.
+    auto isCanonical = [requiredSpatialDims](ArrayRef<int64_t> param) {
+      return param.size() == static_cast<size_t>(requiredSpatialDims);
+    };
+
+    if (isCanonical(strideInts) && isCanonical(paddingInts) &&
+        isCanonical(dilationInts)) {
+      return rewriter.notifyMatchFailure(
+          op, "stride, padding, dialtion and outputPadding is already fully "
+              "specified");
+    }
+
+    if (transposed && isCanonical(outputPaddingInts)) {
+      return rewriter.notifyMatchFailure(
+          op, "output_padding is already fully specified");
+    }
+
+    expand(strideInts, requiredSpatialDims);
+    expand(paddingInts, requiredSpatialDims);
+    expand(dilationInts, requiredSpatialDims);
+
+    if (transposed)
+      expand(outputPaddingInts, requiredSpatialDims);
+
+    // Construct the new List
+    // For example: If user provided padding=[1], and we need 2 or 3 dims, we
+    // create padding=[1, 1] or padding = [1,1,1]
+    Location loc = op.getLoc();
+    SmallVector<Value> cstPadding, cstStrides, cstDilation, cstOutputPadding;
+
+    for (auto dim : llvm::seq<int>(0, requiredSpatialDims)) {
+
+      cstStrides.push_back(Torch::ConstantIntOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(strideInts[dim])));
+
+      cstPadding.push_back(Torch::ConstantIntOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(paddingInts[dim])));
+
+      cstDilation.push_back(Torch::ConstantIntOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(dilationInts[dim])));
+
+      if (transposed)
+        cstOutputPadding.push_back(Torch::ConstantIntOp::create(
+            rewriter, loc, rewriter.getI64IntegerAttr(outputPaddingInts[dim])));
+    }
+
+    auto targetListType =
+        Torch::ListType::get(Torch::IntType::get(op->getContext()));
+
+    // Create the list construct op
+    auto stridesList = Torch::PrimListConstructOp::create(
+        rewriter, loc, targetListType, cstStrides);
+    auto paddingList = Torch::PrimListConstructOp::create(
+        rewriter, loc, targetListType, cstPadding);
+    auto dilationsList = Torch::PrimListConstructOp::create(
+        rewriter, loc, targetListType, cstDilation);
+
+    Value outputPaddingList;
+    if (transposed) {
+      outputPaddingList = Torch::PrimListConstructOp::create(
+          rewriter, loc, targetListType, cstOutputPadding);
+    } else {
+      outputPaddingList = op.getOutputPadding();
+    }
+
+    // Replace the Op
+    // We create a new convolution op, keeping all operands the same except
+    // stride, padding,dilation, and output_padding which are now fully
+    // specified
+    rewriter.replaceOpWithNewOp<AtenConvolutionOp>(
+        op, op.getType(), op.getInput(), op.getWeight(), op.getBias(),
+        stridesList.getResult(), paddingList.getResult(),
+        dilationsList.getResult(), op.getTransposed(), outputPaddingList,
+        op.getGroups());
+
+    return success();
+  }
+};
+} // namespace
+
+//===----------------------------------------------------------------------===//
+// AtenConvolutionOp Registration
+//===----------------------------------------------------------------------===//
+void AtenConvolutionOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                                    MLIRContext *context) {
+  results.add<CanonicalizeConvolutionWithSingleIntTuple>(context);
 }
 
 //===----------------------------------------------------------------------===//
