@@ -551,6 +551,7 @@ cc_library(
     strip_include_prefix = "include",
     deps = [
         ":TorchMLIRConversionTorchOnnxToTorchPassIncGen",
+        ":TorchMLIRConversionUtils",
         ":TorchMLIRTorchDialect",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Pass",
