@@ -1,4 +1,6 @@
 // RUN: torch-mlir-opt <%s -convert-torch-to-linalg -split-input-file -verify-diagnostics | FileCheck %s
+// RUN: torch-mlir-opt <%s -convert-torch-to-linalg=allow-non-finites=false -split-input-file -verify-diagnostics | FileCheck %s -check-prefix=UNSUPPORTED-NON-FINITES
+
 
 // CHECK-LABEL:   func.func @torch.aten.mm$basic(
 // CHECK-SAME:                        %[[LHS_VTENSOR:.*]]: !torch.vtensor<[?,?],f32>,
@@ -264,6 +266,64 @@ func.func @torch.aten.Bool.Tensor$non_zero_rank(%arg0: !torch.vtensor<[?,?],i1>)
 func.func @torch.prim.NumToTensor.Scalar$basic(%arg0: !torch.int) -> !torch.vtensor<[],si64> {
   %0 = torch.prim.NumToTensor.Scalar %arg0 : !torch.int -> !torch.vtensor<[],si64>
   return %0 : !torch.vtensor<[],si64>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.full$bf16$f_to_f
+// CHECK:       %[[F64:.*]] = torch_c.to_f64 %{{.*}}
+// CHECK:       %[[TRUNC:.*]] = arith.truncf %[[F64]] : f64 to bf16
+// CHECK:       %[[EMPTY:.*]] = tensor.empty(%{{.*}}, %{{.*}}) : tensor<?x?xbf16>
+// CHECK:       %[[FILLED:.*]] = linalg.fill ins(%[[TRUNC]] : bf16) outs(%[[EMPTY]] : tensor<?x?xbf16>) -> tensor<?x?xbf16>
+func.func @torch.aten.full$bf16$f_to_f(%dim0: !torch.int, %dim1: !torch.int, %fill: !torch.float) -> !torch.vtensor<[?,?],bf16> {
+  %none = torch.constant.none
+  %0 = torch.prim.ListConstruct %dim0, %dim1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %1 = torch.aten.full %0, %fill, %none, %none, %none, %none : !torch.list<int>, !torch.float, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[?,?],bf16>
+  return %1 : !torch.vtensor<[?,?],bf16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.full$bf16$si_to_f
+// CHECK:       %[[SITOFP:.*]] = arith.sitofp %{{.*}} : i64 to bf16
+// CHECK:       %[[EMPTY:.*]] = tensor.empty(%{{.*}}, %{{.*}}) : tensor<?x?xbf16>
+// CHECK:       %[[FILLED:.*]] = linalg.fill ins(%[[SITOFP]] : bf16) outs(%[[EMPTY]] : tensor<?x?xbf16>) -> tensor<?x?xbf16>
+func.func @torch.aten.full$bf16$si_to_f(%dim0: !torch.int, %dim1: !torch.int, %fill: !torch.int) -> !torch.vtensor<[?,?],bf16> {
+  %none = torch.constant.none
+  %0 = torch.prim.ListConstruct %dim0, %dim1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %1 = torch.aten.full %0, %fill, %none, %none, %none, %none : !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[?,?],bf16>
+  return %1 : !torch.vtensor<[?,?],bf16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.full$si32$f_to_si
+// CHECK:       %[[F64:.*]] = torch_c.to_f64 %{{.*}}
+// CHECK:       %[[FPTOSI:.*]] = arith.fptosi %[[F64]] : f64 to i32
+// CHECK:       %[[EMPTY:.*]] = tensor.empty(%{{.*}}, %{{.*}}) : tensor<?x?xi32>
+// CHECK:       %[[FILLED:.*]] = linalg.fill ins(%[[FPTOSI]] : i32) outs(%[[EMPTY]] : tensor<?x?xi32>) -> tensor<?x?xi32>
+func.func @torch.aten.full$si32$f_to_si(%dim0: !torch.int, %dim1: !torch.int, %fill: !torch.float) -> !torch.vtensor<[?,?],si32> {
+  %none = torch.constant.none
+  %0 = torch.prim.ListConstruct %dim0, %dim1 : (!torch.int, !torch.int) -> !torch.list<int>
+  %1 = torch.aten.full %0, %fill, %none, %none, %none, %none : !torch.list<int>, !torch.float, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[?,?],si32>
+  return %1 : !torch.vtensor<[?,?],si32>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.full$f32$truncf
+// CHECK:       %[[F64:.*]] = torch_c.to_f64 %{{.*}}
+// CHECK:       %[[TRUNC:.*]] = arith.truncf %[[F64]] : f64 to f32
+// CHECK:       %[[EMPTY:.*]] = tensor.empty() : tensor<2048x7168xf32>
+// CHECK:       %[[FILLED:.*]] = linalg.fill ins(%[[TRUNC]] : f32) outs(%[[EMPTY]] : tensor<2048x7168xf32>) -> tensor<2048x7168xf32>
+func.func @torch.aten.full$f32$truncf() -> !torch.vtensor<[2048,7168],f32> {
+  %float0.000000e00 = torch.constant.float 0.000000e+00
+  %none = torch.constant.none
+  %int2048 = torch.constant.int 2048
+  %int7168 = torch.constant.int 7168
+  %0 = torch.prim.ListConstruct %int2048, %int7168 : (!torch.int, !torch.int) -> !torch.list<int>
+  %1 = torch.aten.full %0, %float0.000000e00, %none, %none, %none, %none : !torch.list<int>, !torch.float, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2048,7168],f32>
+  return %1 : !torch.vtensor<[2048,7168],f32>
 }
 
 // -----
@@ -535,4 +595,36 @@ func.func @torch.ops.aten.replication_pad1d$basic(%arg0: !torch.vtensor<[3,5],f3
   %padding = torch.prim.ListConstruct %c1, %c2 : (!torch.int, !torch.int) -> !torch.list<int>
   %0 = torch.aten.replication_pad1d %arg0, %padding : !torch.vtensor<[3,5],f32>, !torch.list<int> -> !torch.vtensor<[3,8],f32>
   return %0 : !torch.vtensor<[3,8],f32>
+}
+
+// -----
+// COM: this test only locks down that allow-non-finites config produces inf/realmax correctly
+// CHECK-LABEL: func.func @torch.aten.min.dim$basic
+// CHECK: arith.constant 0x7F800000 : f32
+// CHECK-NOT: arith.constant 3.40282347E+38 : f32
+// UNSUPPORTED-NON-FINITES: arith.constant 3.40282347E+38 : f32
+// UNSUPPORTED-NON-FINITES-NOT: arith.constant 0x7F800000 : f32
+func.func @torch.aten.min.dim$basic(%arg0: tensor<3x2x3xf32>) -> tensor<3x2x1xf32> {
+  %0 = torch_c.from_builtin_tensor %arg0 : tensor<3x2x3xf32> -> !torch.vtensor<[3,2,3],f32>
+  %true = torch.constant.bool true
+  %int2 = torch.constant.int 2
+  %values, %indices = torch.aten.min.dim %0, %int2, %true : !torch.vtensor<[3,2,3],f32>, !torch.int, !torch.bool -> !torch.vtensor<[3,2,1],f32>, !torch.vtensor<[3,2,1],si64>
+  %1 = torch_c.to_builtin_tensor %values : !torch.vtensor<[3,2,1],f32> -> tensor<3x2x1xf32>
+  return %1 : tensor<3x2x1xf32>
+}
+
+// -----
+// COM: this test only locks down that allow-non-finites config produces inf/realmax correctly
+// CHECK-LABEL: func.func @torch.aten.max.dim$basic
+// CHECK: arith.constant 0xFF800000 : f32
+// CHECK-NOT: arith.constant -3.40282347E+38 : f32
+// UNSUPPORTED-NON-FINITES: arith.constant -3.40282347E+38 : f32
+// UNSUPPORTED-NON-FINITES-NOT: arith.constant 0xFF800000 : f32
+func.func @torch.aten.max.dim$basic(%arg0: tensor<3x2x3xf32>) -> tensor<3x2x1xf32> {
+  %0 = torch_c.from_builtin_tensor %arg0 : tensor<3x2x3xf32> -> !torch.vtensor<[3,2,3],f32>
+  %true = torch.constant.bool true
+  %int2 = torch.constant.int 2
+  %values, %indices = torch.aten.max.dim %0, %int2, %true : !torch.vtensor<[3,2,3],f32>, !torch.int, !torch.bool -> !torch.vtensor<[3,2,1],f32>, !torch.vtensor<[3,2,1],si64>
+  %1 = torch_c.to_builtin_tensor %values : !torch.vtensor<[3,2,1],f32> -> tensor<3x2x1xf32>
+  return %1 : tensor<3x2x1xf32>
 }
