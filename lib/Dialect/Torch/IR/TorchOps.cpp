@@ -6689,3 +6689,92 @@ void OnnxVariantRotaryEmbeddingOp::print(OpAsmPrinter &p) {
   p << " " << getOperands() << " : " << getOperandTypes() << " -> "
     << getResult().getType();
 }
+
+//===----------------------------------------------------------------------===//
+// MatMulNBitsOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult MatMulNBitsOp::verify() {
+  int64_t bits = getBits();
+  if (bits != 2 && bits != 4 && bits != 8)
+    return emitOpError("bits must be 2, 4, or 8, got ") << bits;
+
+  int64_t accuracyLevel = getAccuracyLevel();
+  if (accuracyLevel < 0 || accuracyLevel > 4)
+    return emitOpError("accuracy_level must be 0, 1, 2, 3, or 4, got ")
+           << accuracyLevel;
+
+  // lhs is `[..., M, K]`, so it must be at least rank 2.
+  auto lhsType = cast<Torch::ValueTensorType>(getLhs().getType());
+  if (lhsType.hasSizes() && lhsType.getSizes().size() < 2)
+    return emitOpError("lhs must be at least rank 2, got rank ")
+           << lhsType.getSizes().size();
+
+  auto rhsType = cast<Torch::ValueTensorType>(getRhs().getType());
+  if (rhsType.getSizes().size() != 3)
+    return emitOpError("rhs must be rank 3, got rank ")
+           << rhsType.getSizes().size();
+
+  // scales is rank 2 (TorchOnnxToTorch normalizes the ONNX-allowed 1D form).
+  auto scalesType = cast<Torch::ValueTensorType>(getScales().getType());
+  if (scalesType.hasSizes() && scalesType.getSizes().size() != 2)
+    return emitOpError("scales must be rank 2, got rank ")
+           << scalesType.getSizes().size();
+
+  // zero_points (when present) is also rank 2.
+  if (auto zpType =
+          dyn_cast<Torch::ValueTensorType>(getZeroPoints().getType())) {
+    if (zpType.hasSizes() && zpType.getSizes().size() != 2)
+      return emitOpError("zero_points must be rank 2, got rank ")
+             << zpType.getSizes().size();
+  }
+
+  // bias (when present) is rank 1 of shape `(N,)`.
+  if (auto biasType = dyn_cast<Torch::ValueTensorType>(getBias().getType())) {
+    if (biasType.hasSizes() && biasType.getSizes().size() != 1)
+      return emitOpError("bias must be rank 1, got rank ")
+             << biasType.getSizes().size();
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SubByteUnpackOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SubByteUnpackOp::verify() {
+  int64_t bits = getBits();
+  if (bits != 2 && bits != 4 && bits != 8)
+    return emitOpError("bits must be 2, 4, or 8, got ") << bits;
+
+  auto packedType = cast<Torch::ValueTensorType>(getPacked().getType());
+  auto resultType = cast<Torch::ValueTensorType>(getResult().getType());
+  if (packedType.getSizes().size() != resultType.getSizes().size())
+    return emitOpError("packed and result must have the same rank");
+  if (packedType.getSizes().empty())
+    return emitOpError("packed must have at least rank 1");
+
+  // Each input byte holds 8/bits packed sub-byte values, so the unpacked last
+  // dim must equal packed_last * (8/bits) exactly. Trailing padding is not
+  // supported. Only enforced when both dims are static.
+  int64_t packedLastDim = packedType.getSizes().back();
+  int64_t resultLastDim = resultType.getSizes().back();
+  if (!ShapedType::isDynamic(packedLastDim) &&
+      !ShapedType::isDynamic(resultLastDim)) {
+    int64_t expected = packedLastDim * (8 / bits);
+    if (resultLastDim != expected)
+      return emitOpError("result last dim (")
+             << resultLastDim << ") must equal packed last dim * (8/bits) ("
+             << expected << ")";
+  }
+  return success();
+}
+
+OpFoldResult SubByteUnpackOp::fold(FoldAdaptor adaptor) {
+  // bits == 8 is the identity unpack: each byte already holds one element.
+  // Only fold when the result type matches the operand type.
+  if (getBits() == 8 && getPacked().getType() == getType())
+    return getPacked();
+  return nullptr;
+}

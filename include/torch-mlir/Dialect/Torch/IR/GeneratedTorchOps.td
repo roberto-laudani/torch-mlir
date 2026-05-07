@@ -19195,3 +19195,181 @@ def Torch_TorchvisionNmsOp : Torch_Op<"torchvision.nms", [
   }];
 }
 
+def Torch_MatMulNBitsOp : Torch_Op<"matmul_n_bits", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Block-quantized weight matmul (ONNX MatMulNBits)";
+  let description = [{
+    Corresponds to ONNX's `com.microsoft.MatMulNBits` operator.
+    Ref: https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md#commicrosoftmatmulnbits
+
+    Matrix multiplication where `rhs` weights are block-quantized to `bits`
+    bits per element. Within each block of `block_size` elements
+    along the K dimension, values are packed into bytes and dequantized using
+    per-block `scales` and optional `zero_points`.
+
+    `rhs` has shape `(N, K_blocks, blob_size)` where
+    `K_blocks = ceil(K / block_size)` and `blob_size = ceil(block_size * bits / 8)`.
+
+    The `accuracy_level` attribute controls the compute path:
+      0-3: dequantize weights, matmul in lhs dtype
+      4:   quantize lhs to i8, unpack weights to i8, integer matmul
+
+    Decomposed by `DecomposeMatMulNBitsOp` into either
+    `torch.block_dequant_matmul` (levels 0-3, float path) or
+    `torch.block_quant_matmul` (level 4, integer path).
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$lhs,
+    AnyTorchTensorType:$rhs,
+    AnyTorchTensorType:$scales,
+    AnyTorchOptionalTensorType:$zero_points,
+    AnyTorchOptionalTensorType:$bias,
+    SI64Attr:$accuracy_level,
+    SI64Attr:$bits,
+    SI64Attr:$block_size
+  );
+  let results = (outs
+    AnyTorchTensorType:$result
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult MatMulNBitsOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 5, 1);
+    }
+    void MatMulNBitsOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 5, 1);
+    }
+  }];
+  let hasVerifier = 1;
+}
+
+def Torch_BlockDequantMatMulOp : Torch_Op<"block_dequant_matmul", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Block-dequantize weights and matmul (float path)";
+  let description = [{
+    Block-dequantize weight matrix `rhs` and matmul it against `lhs` in the
+    lhs float dtype.
+
+    Produced by `DecomposeMatMulNBitsOp` for accuracy levels 0-3 (the float
+    compute path of ONNX MatMulNBits). Operand shapes and dtypes are
+    normalized by the decomposer:
+      - `lhs`:         `(..., M, K)`, float
+      - `rhs`:         `(N, K_blocks, block_size)` ui8, sub-byte unpacked
+      - `scales`:      `(N, K_blocks)`, lhs float dtype
+      - `zero_points`: `(N, K_blocks)`. Either ui8 (sub-byte unpacked from
+                       an integer-packed input, or a default of
+                       `2^(bits-1)` materialized when the original ZP was
+                       absent) or per-block float ZP in the lhs float
+                       dtype (passed through unchanged).
+      - `bias`:        optional `(N,)`, lhs float dtype
+      - `result`:      `(..., M, N)`, lhs float dtype
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$lhs,
+    AnyTorchTensorType:$rhs,
+    AnyTorchTensorType:$scales,
+    AnyTorchOptionalTensorType:$zero_points,
+    AnyTorchOptionalTensorType:$bias
+  );
+  let results = (outs
+    AnyTorchTensorType:$result
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult BlockDequantMatMulOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 5, 1);
+    }
+    void BlockDequantMatMulOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 5, 1);
+    }
+  }];
+}
+
+def Torch_SubByteUnpackOp : Torch_Op<"sub_byte_unpack", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Unpack sub-byte-packed uint8 tensor elements";
+  let description = [{
+    Unpacks a `bits`-packed ui8 tensor along its last dimension. The
+    output has the same rank and dtype as the input, with its last dim
+    multiplied by `8 / bits`. Supported values for `bits` are 2, 4, and 8.
+    `bits == 8` is the identity unpack and folds to its input.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$packed,
+    SI64Attr:$bits
+  );
+  let results = (outs
+    AnyTorchTensorType:$result
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult SubByteUnpackOp::parse(OpAsmParser &parser,
+                                       OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 1, 1);
+    }
+    void SubByteUnpackOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 1, 1);
+    }
+  }];
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
+def Torch_BlockQuantMatMulOp : Torch_Op<"block_quant_matmul", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly
+  ]> {
+  let summary = "Block-quantize activations and integer matmul (int8 path)";
+  let description = [{
+    Block-quantize activations and integer matmul against weight matrix
+    `rhs`. The lhs is dynamically quantized to i8 per K-block (symmetric,
+    `scale = max(abs(block)) / 127`); the rhs is zero-point-subtracted
+    into i8 when `bits` in {2, 4} (centered range fits) or i16 when
+    `bits == 8` (centered range is `[-255, 255]`). Both operands are
+    sign-extended to i32, the contraction accumulates in i32, and the
+    result is dequantized to the lhs float dtype using both lhs and rhs
+    scales. An optional `bias` of shape `(N,)` is broadcast-added along N.
+
+    Produced by `DecomposeMatMulNBitsOp` for `accuracy_level == 4`.
+    Operand shapes and dtypes are normalized by the decomposer:
+      - `lhs`:         `(..., M, K)`, float
+      - `rhs`:         `(N, K_blocks, block_size)` ui8, sub-byte unpacked
+      - `scales`:      `(N, K_blocks)`, lhs float dtype
+      - `zero_points`: `(N, K_blocks)` ui8 (sub-byte unpacked from an
+                       integer-packed input, or a default of `2^(bits-1)`
+                       when the original ZP was absent). Float ZP is
+                       unsupported on this path.
+      - `bias`:        optional `(N,)`, lhs float dtype
+      - `result`:      `(..., M, N)`, lhs float dtype
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$lhs,
+    AnyTorchTensorType:$rhs,
+    AnyTorchTensorType:$scales,
+    AnyTorchOptionalTensorType:$zero_points,
+    AnyTorchOptionalTensorType:$bias,
+    SI64Attr:$bits
+  );
+  let results = (outs
+    AnyTorchTensorType:$result
+  );
+  let hasCustomAssemblyFormat = 1;
+  let extraClassDefinition = [{
+    ParseResult BlockQuantMatMulOp::parse(OpAsmParser &parser, OperationState &result) {
+      return parseDefaultTorchOp(parser, result, 5, 1);
+    }
+    void BlockQuantMatMulOp::print(OpAsmPrinter &printer) {
+      printDefaultTorchOp(printer, *this, 5, 1);
+    }
+  }];
+}

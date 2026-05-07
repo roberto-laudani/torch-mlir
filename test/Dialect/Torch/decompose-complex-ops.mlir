@@ -1161,3 +1161,119 @@ func.func @test_int_mm_basic(%arg0: !torch.vtensor<[3,4],si8>, %arg1: !torch.vte
   %0 = torch.aten._int_mm %arg0, %arg1 : !torch.vtensor<[3,4],si8>, !torch.vtensor<[4,5],si8> -> !torch.vtensor<[3,5],si32>
   return %0 : !torch.vtensor<[3,5],si32>
 }
+
+// -----
+
+// Decomposition of torch.matmul_n_bits: native-dtype path with integer (sub-byte
+// packed) zero-points. The decomposition unpacks rhs and
+// integer-typed zero_points via `torch.sub_byte_unpack`, then emits
+// `torch.block_dequant_matmul` consuming the unpacked operands.
+// CHECK-LABEL:   func.func @test_matmul_n_bits_decompose_native_path(
+// CHECK-DAG:     %[[RHS_UNPACKED:.+]] = torch.sub_byte_unpack %arg1 {bits = 4 : si64} : !torch.vtensor<[4,2,8],ui8> -> !torch.vtensor<[4,2,16],ui8>
+// CHECK-DAG:     %[[ZP_UNPACKED:.+]] = torch.sub_byte_unpack %arg3 {bits = 4 : si64} : !torch.vtensor<[4,1],ui8> -> !torch.vtensor<[4,2],ui8>
+// CHECK:         torch.block_dequant_matmul %arg0, %[[RHS_UNPACKED]], %arg2, %[[ZP_UNPACKED]], %arg4
+func.func @test_matmul_n_bits_decompose_native_path(
+    %arg0: !torch.vtensor<[?,?,32],f32>,
+    %arg1: !torch.vtensor<[4,2,8],ui8>,
+    %arg2: !torch.vtensor<[4,2],f32>,
+    %arg3: !torch.vtensor<[4,1],ui8>,
+    %arg4: !torch.vtensor<[4],f32>) -> !torch.vtensor<[?,?,4],f32> {
+  %0 = torch.matmul_n_bits %arg0, %arg1, %arg2, %arg3, %arg4
+       {accuracy_level = 0 : si64, bits = 4 : si64, block_size = 16 : si64} :
+       !torch.vtensor<[?,?,32],f32>, !torch.vtensor<[4,2,8],ui8>,
+       !torch.vtensor<[4,2],f32>, !torch.vtensor<[4,1],ui8>,
+       !torch.vtensor<[4],f32> -> !torch.vtensor<[?,?,4],f32>
+  return %0 : !torch.vtensor<[?,?,4],f32>
+}
+
+// -----
+
+// Decomposition of torch.matmul_n_bits: int8 path (accuracy_level 4).
+// Rewrites to torch.block_quant_matmul, which runs dynamic int8 activation
+// quantization and an i8 x i8 -> i32 matmul. The pre-unpack pattern is the
+// same as the native path: rhs and integer zero_points are unpacked first.
+// CHECK-LABEL:   func.func @test_matmul_n_bits_decompose_int8_path(
+// CHECK-DAG:     %[[RHS_UNPACKED:.+]] = torch.sub_byte_unpack %arg1 {bits = 4 : si64} : !torch.vtensor<[4,2,8],ui8> -> !torch.vtensor<[4,2,16],ui8>
+// CHECK-DAG:     %[[ZP_UNPACKED:.+]] = torch.sub_byte_unpack %arg3 {bits = 4 : si64} : !torch.vtensor<[4,1],ui8> -> !torch.vtensor<[4,2],ui8>
+// CHECK:         torch.block_quant_matmul %arg0, %[[RHS_UNPACKED]], %arg2, %[[ZP_UNPACKED]], %arg4 {bits = 4 : si64}
+func.func @test_matmul_n_bits_decompose_int8_path(
+    %arg0: !torch.vtensor<[?,?,32],f32>,
+    %arg1: !torch.vtensor<[4,2,8],ui8>,
+    %arg2: !torch.vtensor<[4,2],f32>,
+    %arg3: !torch.vtensor<[4,1],ui8>,
+    %arg4: !torch.vtensor<[4],f32>) -> !torch.vtensor<[?,?,4],f32> {
+  %0 = torch.matmul_n_bits %arg0, %arg1, %arg2, %arg3, %arg4
+       {accuracy_level = 4 : si64, bits = 4 : si64, block_size = 16 : si64} :
+       !torch.vtensor<[?,?,32],f32>, !torch.vtensor<[4,2,8],ui8>,
+       !torch.vtensor<[4,2],f32>, !torch.vtensor<[4,1],ui8>,
+       !torch.vtensor<[4],f32> -> !torch.vtensor<[?,?,4],f32>
+  return %0 : !torch.vtensor<[?,?,4],f32>
+}
+
+// -----
+
+// Decomposition of torch.matmul_n_bits with per-block float zero-points.
+// Float ZP is never sub-byte-packed, so it must pass through unchanged.
+// CHECK-LABEL:   func.func @test_matmul_n_bits_decompose_float_zp(
+// CHECK-NOT:     torch.sub_byte_unpack %arg3
+// CHECK:         %[[RHS_UNPACKED:.+]] = torch.sub_byte_unpack %arg1 {bits = 4 : si64} : !torch.vtensor<[4,2,8],ui8> -> !torch.vtensor<[4,2,16],ui8>
+// CHECK-NOT:     torch.sub_byte_unpack %arg3
+// CHECK:         torch.block_dequant_matmul %arg0, %[[RHS_UNPACKED]], %arg2, %arg3, %{{.*}}
+func.func @test_matmul_n_bits_decompose_float_zp(
+    %arg0: !torch.vtensor<[?,?,32],f32>,
+    %arg1: !torch.vtensor<[4,2,8],ui8>,
+    %arg2: !torch.vtensor<[4,2],f32>,
+    %arg3: !torch.vtensor<[4,2],f32>) -> !torch.vtensor<[?,?,4],f32> {
+  %none = torch.constant.none
+  %0 = torch.matmul_n_bits %arg0, %arg1, %arg2, %arg3, %none
+       {accuracy_level = 1 : si64, bits = 4 : si64, block_size = 16 : si64} :
+       !torch.vtensor<[?,?,32],f32>, !torch.vtensor<[4,2,8],ui8>,
+       !torch.vtensor<[4,2],f32>, !torch.vtensor<[4,2],f32>,
+       !torch.none -> !torch.vtensor<[?,?,4],f32>
+  return %0 : !torch.vtensor<[?,?,4],f32>
+}
+
+// -----
+
+// Decomposition of torch.matmul_n_bits with no zero-points (None).
+// The None ZP is materialized to a (N, KB) ui8 literal of 2^(bits-1).
+// The None bias passes through unchanged.
+// CHECK-LABEL:   func.func @test_matmul_n_bits_decompose_none_zp(
+// CHECK-DAG:     %[[NONE:.+]] = torch.constant.none
+// CHECK-DAG:     %[[DEFAULT_ZP:.+]] = torch.vtensor.literal(dense<8> : tensor<4x2xui8>) : !torch.vtensor<[4,2],ui8>
+// CHECK-DAG:     %[[RHS_UNPACKED:.+]] = torch.sub_byte_unpack %arg1 {bits = 4 : si64} : !torch.vtensor<[4,2,8],ui8> -> !torch.vtensor<[4,2,16],ui8>
+// CHECK:         torch.block_dequant_matmul %arg0, %[[RHS_UNPACKED]], %arg2, %[[DEFAULT_ZP]], %[[NONE]]
+func.func @test_matmul_n_bits_decompose_none_zp(
+    %arg0: !torch.vtensor<[?,?,32],f32>,
+    %arg1: !torch.vtensor<[4,2,8],ui8>,
+    %arg2: !torch.vtensor<[4,2],f32>) -> !torch.vtensor<[?,?,4],f32> {
+  %none = torch.constant.none
+  %0 = torch.matmul_n_bits %arg0, %arg1, %arg2, %none, %none
+       {accuracy_level = 0 : si64, bits = 4 : si64, block_size = 16 : si64} :
+       !torch.vtensor<[?,?,32],f32>, !torch.vtensor<[4,2,8],ui8>,
+       !torch.vtensor<[4,2],f32>, !torch.none, !torch.none
+       -> !torch.vtensor<[?,?,4],f32>
+  return %0 : !torch.vtensor<[?,?,4],f32>
+}
+
+// -----
+
+// Decomposition with bits=8: torch.sub_byte_unpack is the identity and folds
+// to its input (SubByteUnpackOp::fold). No unpack op appears in the output.
+// CHECK-LABEL:   func.func @test_matmul_n_bits_decompose_bits8(
+// CHECK-NOT:     torch.sub_byte_unpack
+// CHECK:         torch.block_dequant_matmul %arg0, %arg1, %arg2, %arg3, %{{.*}}
+func.func @test_matmul_n_bits_decompose_bits8(
+    %arg0: !torch.vtensor<[?,?,32],f32>,
+    %arg1: !torch.vtensor<[4,2,16],ui8>,
+    %arg2: !torch.vtensor<[4,2],f32>,
+    %arg3: !torch.vtensor<[4,2],ui8>) -> !torch.vtensor<[?,?,4],f32> {
+  %none = torch.constant.none
+  %0 = torch.matmul_n_bits %arg0, %arg1, %arg2, %arg3, %none
+       {accuracy_level = 0 : si64, bits = 8 : si64, block_size = 16 : si64} :
+       !torch.vtensor<[?,?,32],f32>, !torch.vtensor<[4,2,16],ui8>,
+       !torch.vtensor<[4,2],f32>, !torch.vtensor<[4,2],ui8>,
+       !torch.none -> !torch.vtensor<[?,?,4],f32>
+  return %0 : !torch.vtensor<[?,?,4],f32>
+}
+

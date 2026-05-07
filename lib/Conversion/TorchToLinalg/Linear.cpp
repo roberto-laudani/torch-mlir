@@ -10,10 +10,13 @@
 #include "torch-mlir/Conversion/TorchToLinalg/TorchToLinalg.h"
 
 #include "PopulatePatterns.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/TorchToLinalg/Utils.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
@@ -2475,6 +2478,605 @@ struct ConvertAtenFftRfftOp final : OpConversionPattern<AtenFftRfftOp> {
 
 } // namespace
 
+namespace {
+// Prepends batchRank leading dim-exprs (d0, ..., d_{batchRank-1}) before the
+// non-batch exprs.
+static SmallVector<AffineExpr>
+prependBatchExprs(OpBuilder &builder, int64_t batchRank,
+                  ArrayRef<AffineExpr> nonBatchExprs) {
+  SmallVector<AffineExpr> exprs;
+  for (int64_t i = 0; i < batchRank; ++i)
+    exprs.push_back(builder.getAffineDimExpr(i));
+  exprs.append(nonBatchExprs.begin(), nonBatchExprs.end());
+  return exprs;
+}
+
+// Prepends batchRank parallel iterator types before the non-batch iterators.
+static SmallVector<utils::IteratorType>
+prependBatchIters(int64_t batchRank,
+                  ArrayRef<utils::IteratorType> nonBatchIters) {
+  SmallVector<utils::IteratorType> iters(batchRank,
+                                         utils::IteratorType::parallel);
+  iters.append(nonBatchIters.begin(), nonBatchIters.end());
+  return iters;
+}
+
+// Returns the leading batchRank runtime sizes of value.
+static SmallVector<OpFoldResult> batchSizesOf(OpBuilder &builder, Location loc,
+                                              Value value, int64_t batchRank) {
+  SmallVector<OpFoldResult> sizes;
+  for (int64_t i = 0; i < batchRank; ++i)
+    sizes.push_back(tensor::getMixedSize(builder, loc, value, i));
+  return sizes;
+}
+
+// Adds (N,) bias to the (..., M, N) matmul result.
+static Value addBias(OpBuilder &builder, Location loc, Value matmulResult,
+                     Value bias, int64_t batchRank) {
+  AffineExpr dM = builder.getAffineDimExpr(batchRank);
+  AffineExpr dN = builder.getAffineDimExpr(batchRank + 1);
+
+  SmallVector<AffineExpr> biasExprs = {dN};
+  auto mmExprs = prependBatchExprs(builder, batchRank, {dM, dN});
+  auto indexingMaps = AffineMap::inferFromExprList(
+      {biasExprs, mmExprs, mmExprs}, builder.getContext());
+
+  SmallVector<utils::IteratorType> iterators(
+      mmExprs.size(), utils::IteratorType::parallel);
+
+  auto biasResultShape = tensor::getMixedSizes(builder, loc, matmulResult);
+  Type elemType =
+      cast<RankedTensorType>(matmulResult.getType()).getElementType();
+  Value biasOutputs =
+      tensor::EmptyOp::create(builder, loc, biasResultShape, elemType);
+
+  return linalg::GenericOp::create(
+             builder, loc, biasOutputs.getType(),
+             /*inputs=*/ValueRange{bias, matmulResult},
+             /*outputs=*/biasOutputs, indexingMaps, iterators,
+             [&](OpBuilder &b, Location loc, ValueRange args) {
+               Value biasVal = args[0];
+               Value mmVal = args[1];
+               Value sum = arith::AddFOp::create(b, loc, biasVal, mmVal);
+               linalg::YieldOp::create(b, loc, sum);
+             })
+      .getResult(0);
+}
+
+// Splits the trailing K dim of lhs into (kBlocks, blockSize).
+static Value expandLhsToBlocks(OpBuilder &builder, Location loc, Value lhs,
+                               int64_t kBlocks, int64_t blockSize) {
+  auto lhsType = cast<RankedTensorType>(lhs.getType());
+  int64_t lhsRank = lhsType.getRank();
+
+  SmallVector<ReassociationIndices> reassociation(lhsRank);
+  for (int64_t i = 0; i < lhsRank - 1; ++i)
+    reassociation[i] = {i};
+  reassociation.back() = {lhsRank - 1, lhsRank};
+
+  auto lhsExpandedShape = llvm::to_vector(lhsType.getShape().drop_back());
+  lhsExpandedShape.push_back(kBlocks);
+  lhsExpandedShape.push_back(blockSize);
+  auto lhsExpandedType =
+      RankedTensorType::get(lhsExpandedShape, lhsType.getElementType());
+
+  return tensor::ExpandShapeOp::create(builder, loc, lhsExpandedType, lhs,
+                                       reassociation);
+}
+} // namespace
+
+namespace {
+class ConvertBlockDequantMatMulOp
+    : public OpConversionPattern<Torch::BlockDequantMatMulOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(Torch::BlockDequantMatMulOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    MLIRContext *context = op->getContext();
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    Value rhsScales = adaptor.getScales();
+    Value rhsZeroPoints = adaptor.getZeroPoints();
+    Value bias = adaptor.getBias();
+
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    auto lhsType = cast<RankedTensorType>(lhs.getType());
+    auto lhsDType = lhsType.getElementType();
+    int64_t lhsRank = lhsType.getRank();
+    // lhs has shape [..., M, K]; subtract M and K to count batch dims.
+    int64_t batchRank = lhsRank - 2;
+
+    auto rhsType = cast<RankedTensorType>(rhs.getType());
+    int64_t rhsRank = rhsType.getRank();
+
+    auto resultType =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+
+    auto rhsShape = rhsType.getShape(); // (N, KB, BS)
+
+    // Step 1: Dequantize rhs: (rhs - zp) * scale.
+    AffineExpr nDim = rewriter.getAffineDimExpr(0);
+    AffineExpr kbDim = rewriter.getAffineDimExpr(1);
+    AffineMap rhsIdentityMap =
+        AffineMap::getMultiDimIdentityMap(rhsRank, context);
+    AffineMap rhsScalesZpMap =
+        AffineMap::get(rhsRank, 0, {nDim, kbDim}, context);
+
+    SmallVector<Value> dequantInputs = {rhs, rhsScales, rhsZeroPoints};
+    SmallVector<AffineMap> dequantMaps = {rhsIdentityMap, rhsScalesZpMap,
+                                          rhsScalesZpMap, rhsIdentityMap};
+
+    SmallVector<utils::IteratorType> dequantIterators(
+        rhsRank, utils::IteratorType::parallel);
+
+    auto rhsDequantType = RankedTensorType::get(rhsShape, lhsDType);
+    Value dequantInit = tensor::EmptyOp::create(
+        rewriter, loc, tensor::getMixedSizes(rewriter, loc, rhs), lhsDType);
+
+    Value rhsDequant =
+        linalg::GenericOp::create(
+            rewriter, loc, rhsDequantType, dequantInputs, dequantInit,
+            dequantMaps, dequantIterators,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value rhsVal = args[0];
+              Value scale = args[1];
+              Value zpVal = args[2];
+              Value rhsFloat =
+                  arith::UIToFPOp::create(b, loc, lhsDType, rhsVal);
+              Value zpFloat =
+                  isa<mlir::FloatType>(zpVal.getType())
+                      ? zpVal
+                      : arith::UIToFPOp::create(b, loc, lhsDType, zpVal)
+                            .getResult();
+              Value shifted = arith::SubFOp::create(b, loc, rhsFloat, zpFloat);
+              Value scaled = arith::MulFOp::create(b, loc, shifted, scale);
+              linalg::YieldOp::create(b, loc, scaled);
+            })
+            .getResult(0);
+
+    // Step 2: Expand lhs (..., M, K) -> (..., M, KB, BS).
+    Value lhsExpanded = expandLhsToBlocks(rewriter, loc, lhs,
+                                          /*kBlocks=*/rhsShape[1],
+                                          /*blockSize=*/rhsShape[2]);
+
+    // Step 3: Blocked matrix multiplication
+    // lhsExpanded (..., M, KB, BS) x rhsDequant (N, KB, BS) -> matmulResult
+    // (..., M, N).
+    AffineExpr dM = rewriter.getAffineDimExpr(batchRank);
+    AffineExpr dN = rewriter.getAffineDimExpr(batchRank + 1);
+    AffineExpr dKB = rewriter.getAffineDimExpr(batchRank + 2);
+    AffineExpr dBS = rewriter.getAffineDimExpr(batchRank + 3);
+
+    SmallVector<AffineExpr> matmulLhsExprs =
+        prependBatchExprs(rewriter, batchRank, {dM, dKB, dBS});
+    SmallVector<AffineExpr> matmulRhsExprs = {dN, dKB, dBS};
+    SmallVector<AffineExpr> matmulOutExprs =
+        prependBatchExprs(rewriter, batchRank, {dM, dN});
+    auto matmulIndexingMaps = AffineMap::inferFromExprList(
+        {matmulLhsExprs, matmulRhsExprs, matmulOutExprs}, context);
+
+    SmallVector<utils::IteratorType> matmulIterators = prependBatchIters(
+        batchRank, {utils::IteratorType::parallel,    // M dimension
+                    utils::IteratorType::parallel,    // N dimension
+                    utils::IteratorType::reduction,   // KB dimension
+                    utils::IteratorType::reduction}); // BS dimension
+
+    SmallVector<OpFoldResult> matmulResultShape =
+        batchSizesOf(rewriter, loc, lhs, batchRank);
+    matmulResultShape.push_back(
+        tensor::getMixedSize(rewriter, loc, lhs, batchRank)); // M dimension
+    matmulResultShape.push_back(
+        tensor::getMixedSize(rewriter, loc, rhs, 0));         // N dimension
+
+    Value matmulEmpty =
+        tensor::EmptyOp::create(rewriter, loc, matmulResultShape, lhsDType);
+    Value c0F = arith::ConstantOp::create(rewriter, loc,
+                                          rewriter.getZeroAttr(lhsDType));
+    Value matmulInit =
+        linalg::FillOp::create(rewriter, loc, c0F, matmulEmpty).getResult(0);
+
+    Value matmulResult =
+        linalg::GenericOp::create(
+            rewriter, loc, matmulInit.getType(),
+            /*inputs=*/ValueRange{lhsExpanded, rhsDequant},
+            /*outputs=*/matmulInit, matmulIndexingMaps, matmulIterators,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value lhsVal = args[0];
+              Value rhsVal = args[1];
+              Value acc = args[2];
+              Value prod = arith::MulFOp::create(b, loc, lhsVal, rhsVal);
+              Value sum = arith::AddFOp::create(b, loc, prod, acc);
+              linalg::YieldOp::create(b, loc, sum);
+            })
+            .getResult(0);
+
+    // Step 4: Add bias
+    Value result = matmulResult;
+    if (!isa<Torch::NoneType>(bias.getType()))
+      result = addBias(rewriter, loc, matmulResult, bias, batchRank);
+
+    if (result.getType() == resultType)
+      rewriter.replaceOp(op, result);
+    else
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, result);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
+class ConvertBlockQuantMatMulOp
+    : public OpConversionPattern<Torch::BlockQuantMatMulOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(Torch::BlockQuantMatMulOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    MLIRContext *context = op->getContext();
+
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+    Value rhsScales = adaptor.getScales();
+    Value rhsZeroPoints = adaptor.getZeroPoints();
+    Value bias = adaptor.getBias();
+
+    auto resultType =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    auto lhsType = cast<RankedTensorType>(lhs.getType());
+    auto lhsDType = lhsType.getElementType();
+    int64_t lhsRank = lhsType.getRank();
+    // lhs has shape [..., M, K]; subtract M and K to count batch dims.
+    int64_t batchRank = lhsRank - 2;
+
+    auto rhsType = cast<RankedTensorType>(rhs.getType());
+
+    auto rhsShape = rhsType.getShape(); // (N, KB, BS)
+
+    SmallVector<OpFoldResult> batchDims =
+        batchSizesOf(rewriter, loc, lhs, batchRank);
+    OpFoldResult mSize = tensor::getMixedSize(rewriter, loc, lhs, batchRank);
+    OpFoldResult nSize = tensor::getMixedSize(rewriter, loc, rhs, 0);
+    OpFoldResult kbSize = tensor::getMixedSize(rewriter, loc, rhs, 1);
+
+    auto zpDType =
+        cast<RankedTensorType>(rhsZeroPoints.getType()).getElementType();
+    if (isa<mlir::FloatType>(zpDType))
+      return rewriter.notifyMatchFailure(
+          op, "unsupported: floating-point zero-points on integer path");
+
+    // Step 1: Dynamically quantize lhs per-block to int8.
+    Value cstInt8Max = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getFloatAttr(lhsDType, 127.0));
+    Value cstInt8Min = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getFloatAttr(lhsDType, -128.0));
+
+    // Step 1a: Reshape lhs (..., M, K) -> (..., M, KB, BS).
+    Value lhsExpanded = expandLhsToBlocks(rewriter, loc, lhs,
+                                          /*kBlocks=*/rhsShape[1],
+                                          /*blockSize=*/rhsShape[2]);
+    int64_t lhsExpandedRank =
+        cast<RankedTensorType>(lhsExpanded.getType()).getRank();
+
+    // Step 1b: Compute block-wise lhs MaxAbs
+    AffineExpr d0 = rewriter.getAffineDimExpr(batchRank);     // M dimension
+    AffineExpr d1 = rewriter.getAffineDimExpr(batchRank + 1); // KB dimension
+
+    AffineMap lhsBlockIdentityMap =
+        AffineMap::getMultiDimIdentityMap(lhsExpandedRank, context);
+    AffineMap lhsBlockBroadcastMap =
+        AffineMap::get(lhsExpandedRank, 0,
+                       prependBatchExprs(rewriter, batchRank, {d0, d1}),
+                       context);
+
+    SmallVector<utils::IteratorType> maxAbsIterators = prependBatchIters(
+        batchRank, {utils::IteratorType::parallel,    // M dimension
+                    utils::IteratorType::parallel,    // KB dimension
+                    utils::IteratorType::reduction}); // BS dimension
+
+    SmallVector<OpFoldResult> maxAbsShape = batchDims;
+    maxAbsShape.push_back(mSize);
+    maxAbsShape.push_back(kbSize);
+
+    Value maxAbsEmpty =
+        tensor::EmptyOp::create(rewriter, loc, maxAbsShape, lhsDType);
+    Value c0F = arith::ConstantOp::create(rewriter, loc,
+                                          rewriter.getZeroAttr(lhsDType));
+    Value maxAbsInit =
+        linalg::FillOp::create(rewriter, loc, c0F, maxAbsEmpty).getResult(0);
+
+    SmallVector<AffineMap> maxAbsMaps = {lhsBlockIdentityMap,
+                                         lhsBlockBroadcastMap};
+    Value lhsMaxAbs = linalg::GenericOp::create(
+                          rewriter, loc, maxAbsInit.getType(),
+                          /*inputs=*/ValueRange{lhsExpanded},
+                          /*outputs=*/maxAbsInit, maxAbsMaps, maxAbsIterators,
+                          [&](OpBuilder &b, Location loc, ValueRange args) {
+                            Value l = args[0];
+                            Value acc = args[1];
+                            Value lAbs = math::AbsFOp::create(b, loc, l);
+                            Value lAbsMax =
+                                arith::MaximumFOp::create(b, loc, lAbs, acc);
+                            linalg::YieldOp::create(b, loc, lAbsMax);
+                          })
+                          .getResult(0);
+
+    // Step 1c: Compute lhsScales = MaxAbs / 127.
+    AffineMap lhsScalesMap =
+        AffineMap::getMultiDimIdentityMap(2 + batchRank, context);
+
+    SmallVector<OpFoldResult> lhsScalesShape = batchDims;
+    lhsScalesShape.push_back(mSize);
+    lhsScalesShape.push_back(kbSize);
+
+    Value lhsScalesInit =
+        tensor::EmptyOp::create(rewriter, loc, lhsScalesShape, lhsDType);
+
+    SmallVector<utils::IteratorType> lhsScalesIterators(
+        2 + batchRank, utils::IteratorType::parallel);
+
+    SmallVector<AffineMap> lhsScalesMaps = {lhsScalesMap, lhsScalesMap};
+
+    Value lhsScales =
+        linalg::GenericOp::create(
+            rewriter, loc, lhsScalesInit.getType(),
+            /*inputs=*/ValueRange{lhsMaxAbs},
+            /*outputs=*/lhsScalesInit, lhsScalesMaps, lhsScalesIterators,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value lMaxAbs = args[0];
+              Value lScale =
+                  arith::DivFOp::create(b, loc, lMaxAbs, cstInt8Max);
+              linalg::YieldOp::create(b, loc, lScale);
+            })
+            .getResult(0);
+
+    // Step 1c': lhsInvScales = 127 / MaxAbs
+    Value lhsInvScalesInit =
+        tensor::EmptyOp::create(rewriter, loc, lhsScalesShape, lhsDType);
+    Value lhsInvScales =
+        linalg::GenericOp::create(
+            rewriter, loc, lhsInvScalesInit.getType(),
+            /*inputs=*/ValueRange{lhsMaxAbs},
+            /*outputs=*/lhsInvScalesInit, lhsScalesMaps, lhsScalesIterators,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value lMaxAbs = args[0];
+              Value c0 =
+                  arith::ConstantOp::create(b, loc, b.getZeroAttr(lhsDType));
+              Value isZero = arith::CmpFOp::create(
+                  b, loc, arith::CmpFPredicate::OEQ, lMaxAbs, c0);
+              Value invScale =
+                  arith::DivFOp::create(b, loc, cstInt8Max, lMaxAbs);
+              Value safeInv =
+                  arith::SelectOp::create(b, loc, isZero, c0, invScale);
+              linalg::YieldOp::create(b, loc, safeInv);
+            })
+            .getResult(0);
+
+    // Step 1d: Quantize lhs (..., M, KB, BS) float -> (..., M, KB, BS) i8.
+    SmallVector<OpFoldResult> lhsQShape = batchDims;
+    lhsQShape.push_back(mSize);
+    lhsQShape.push_back(kbSize);
+    lhsQShape.push_back(rewriter.getIndexAttr(rhsShape[2]));
+
+    Value lhsQInit =
+        tensor::EmptyOp::create(rewriter, loc, lhsQShape, rewriter.getI8Type());
+
+    SmallVector<AffineMap> lhsQMaps = {
+        lhsBlockIdentityMap, lhsBlockBroadcastMap, lhsBlockIdentityMap};
+    SmallVector<utils::IteratorType> lhsQIterators(
+        lhsExpandedRank, utils::IteratorType::parallel);
+    Value lhsQ = linalg::GenericOp::create(
+                     rewriter, loc, lhsQInit.getType(),
+                     /*inputs=*/ValueRange{lhsExpanded, lhsInvScales},
+                     /*outputs=*/lhsQInit, lhsQMaps, lhsQIterators,
+                     [&](OpBuilder &b, Location loc, ValueRange args) {
+                       Value l = args[0];
+                       Value lInvScale = args[1];
+                       // q = clamp(round(l * inverseScale)) in symmetric int8.
+                       Value qF = arith::MulFOp::create(b, loc, l, lInvScale);
+                       qF = math::RoundEvenOp::create(b, loc, qF);
+                       qF = arith::MaximumFOp::create(b, loc, qF, cstInt8Min);
+                       qF = arith::MinimumFOp::create(b, loc, qF, cstInt8Max);
+                       Value qI8 =
+                           arith::FPToSIOp::create(b, loc, b.getI8Type(), qF);
+                       linalg::YieldOp::create(b, loc, qI8);
+                     })
+                     .getResult(0);
+
+    // Step 2: Blocked integer matmul with fused zero-point subtraction.
+    // lhsQ (..., M, KB, BS) x (rhs - rhsZeroPoints) (N, KB, BS)
+    //   -> intAcc (..., M, N, KB).
+    AffineExpr dM = rewriter.getAffineDimExpr(batchRank);
+    AffineExpr dN = rewriter.getAffineDimExpr(batchRank + 1);
+    AffineExpr dKB = rewriter.getAffineDimExpr(batchRank + 2);
+    AffineExpr dBS = rewriter.getAffineDimExpr(batchRank + 3);
+
+    SmallVector<AffineExpr> matmulLhsExprs =
+        prependBatchExprs(rewriter, batchRank, {dM, dKB, dBS});
+    SmallVector<AffineExpr> matmulRhsExprs = {dN, dKB, dBS}; // rhs not batched
+    SmallVector<AffineExpr> matmulZpExprs = {dN, dKB};       // broadcast over BS
+    SmallVector<AffineExpr> matmulOutExprs =
+        prependBatchExprs(rewriter, batchRank, {dM, dN, dKB});
+    auto matmulIndexingMaps = AffineMap::inferFromExprList(
+        {matmulLhsExprs, matmulRhsExprs, matmulZpExprs, matmulOutExprs},
+        context);
+
+    SmallVector<utils::IteratorType> matmulIterators = prependBatchIters(
+        batchRank, {utils::IteratorType::parallel,    // M dimension
+                    utils::IteratorType::parallel,    // N dimension
+                    utils::IteratorType::parallel,    // KB dimension
+                    utils::IteratorType::reduction}); // BS dimension
+
+    SmallVector<OpFoldResult> matmulResultShape = batchDims;
+    matmulResultShape.push_back(mSize);
+    matmulResultShape.push_back(nSize);
+    matmulResultShape.push_back(kbSize);
+
+    Value matmulEmpty = tensor::EmptyOp::create(
+        rewriter, loc, matmulResultShape, rewriter.getI32Type());
+    Value c0I32 =
+        arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+    Value matmulInit =
+        linalg::FillOp::create(rewriter, loc, c0I32, matmulEmpty).getResult(0);
+
+    Value matmulResult =
+        linalg::GenericOp::create(
+            rewriter, loc, matmulInit.getType(),
+            /*inputs=*/ValueRange{lhsQ, rhs, rhsZeroPoints},
+            /*outputs=*/matmulInit, matmulIndexingMaps, matmulIterators,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value l = args[0];
+              Value r = args[1];
+              Value zp = args[2];
+              Value acc = args[3];
+              Type i32Ty = b.getI32Type();
+              Value lExt = arith::ExtSIOp::create(b, loc, i32Ty, l);
+              Value rExt = arith::ExtUIOp::create(b, loc, i32Ty, r);
+              Value zpExt = arith::ExtUIOp::create(b, loc, i32Ty, zp);
+              Value rShifted = arith::SubIOp::create(b, loc, rExt, zpExt);
+              Value prod = arith::MulIOp::create(b, loc, lExt, rShifted);
+              Value sum = arith::AddIOp::create(b, loc, prod, acc);
+              linalg::YieldOp::create(b, loc, sum);
+            })
+            .getResult(0);
+
+    // Step 3: Dequantize result.
+    SmallVector<AffineExpr> intAccExprs =
+        prependBatchExprs(rewriter, batchRank, {dM, dN, dKB});
+    SmallVector<AffineExpr> lhsScalesExprs =
+        prependBatchExprs(rewriter, batchRank, {dM, dKB});
+    SmallVector<AffineExpr> rhsScalesExprs = {dN, dKB};
+    SmallVector<AffineExpr> dequantOutExprs =
+        prependBatchExprs(rewriter, batchRank, {dM, dN});
+    auto dequantIndexingMaps = AffineMap::inferFromExprList(
+        {intAccExprs, lhsScalesExprs, rhsScalesExprs, dequantOutExprs},
+        context);
+
+    SmallVector<utils::IteratorType> dequantIterators = prependBatchIters(
+        batchRank, {utils::IteratorType::parallel,    // M dimension
+                    utils::IteratorType::parallel,    // N dimension
+                    utils::IteratorType::reduction}); // KB dimension
+
+    SmallVector<OpFoldResult> dequantResultShape = batchDims;
+    dequantResultShape.push_back(mSize);
+    dequantResultShape.push_back(nSize);
+    Value dequantEmpty =
+        tensor::EmptyOp::create(rewriter, loc, dequantResultShape, lhsDType);
+    Value dequantInit =
+        linalg::FillOp::create(rewriter, loc, c0F, dequantEmpty).getResult(0);
+
+    Value dequantResult =
+        linalg::GenericOp::create(
+            rewriter, loc, dequantInit.getType(),
+            /*inputs=*/ValueRange{matmulResult, lhsScales, rhsScales},
+            /*outputs=*/dequantInit, dequantIndexingMaps, dequantIterators,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value intVal = args[0];   // i32
+              Value lhsScale = args[1]; // lhsDType
+              Value rhsScale = args[2]; // lhsDType
+              Value acc = args[3];      // lhsDType
+              Value intAccF = arith::SIToFPOp::create(b, loc, lhsDType, intVal);
+              Value lhsDeq = arith::MulFOp::create(b, loc, intAccF, lhsScale);
+              Value blockDeq = arith::MulFOp::create(b, loc, lhsDeq, rhsScale);
+              Value sum = arith::AddFOp::create(b, loc, blockDeq, acc);
+              linalg::YieldOp::create(b, loc, sum);
+            })
+            .getResult(0);
+
+    // Step 4: Add bias
+    Value result = dequantResult;
+    if (!isa<Torch::NoneType>(bias.getType()))
+      result = addBias(rewriter, loc, dequantResult, bias, batchRank);
+
+    if (result.getType() == resultType)
+      rewriter.replaceOp(op, result);
+    else
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, resultType, result);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
+// Unpacks sub-byte-packed uint8 elements along the last dim of the input.
+class ConvertSubByteUnpackOp
+    : public OpConversionPattern<Torch::SubByteUnpackOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(Torch::SubByteUnpackOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+
+    Value packed = adaptor.getPacked();
+    auto packedType = cast<RankedTensorType>(packed.getType());
+    int64_t rank = packedType.getRank();
+    int64_t unpackedRank = rank + 1;
+
+    Type newResultType = getTypeConverter()->convertType(op.getType());
+
+    int64_t bits = op.getBits();
+    int64_t numElemsPerByte = 8 / bits;
+
+    SmallVector<OpFoldResult> unpackShape =
+        tensor::getMixedSizes(rewriter, loc, packed);
+    unpackShape.push_back(rewriter.getIndexAttr(numElemsPerByte));
+
+    Value unpackInit = tensor::EmptyOp::create(
+        rewriter, loc, unpackShape, rewriter.getI8Type());
+
+    AffineMap outputMap =
+        AffineMap::getMultiDimIdentityMap(unpackedRank, rewriter.getContext());
+    AffineMap inputMap = outputMap.getMajorSubMap(rank);
+
+    SmallVector<utils::IteratorType> iterators(unpackedRank,
+                                               utils::IteratorType::parallel);
+
+    Value unpackResult =
+        linalg::GenericOp::create(
+            rewriter, loc, unpackInit.getType(),
+            /*inputs=*/ValueRange{packed},
+            /*outputs=*/unpackInit,
+            SmallVector<AffineMap>{inputMap, outputMap}, iterators,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              Value packedByte = args[0];
+              Value fieldIndex = linalg::IndexOp::create(b, loc, rank);
+              Value fieldInt = arith::IndexCastOp::create(
+                  b, loc, b.getI8Type(), fieldIndex);
+              Value bitsCst = arith::ConstantIntOp::create(b, loc, bits, 8);
+              Value mask =
+                  arith::ConstantIntOp::create(b, loc, (1 << bits) - 1, 8);
+              Value shift = arith::MulIOp::create(b, loc, fieldInt, bitsCst);
+              Value shifted = arith::ShRUIOp::create(b, loc, packedByte, shift);
+              Value unpacked = arith::AndIOp::create(b, loc, shifted, mask);
+              linalg::YieldOp::create(b, loc, unpacked);
+            })
+            .getResult(0);
+
+    // Collapse the last two dims into a single one.
+    SmallVector<ReassociationIndices> reassociation(rank);
+    for (int64_t i = 0; i < rank - 1; ++i)
+      reassociation[i] = {i};
+    reassociation.back() = {rank - 1, rank};
+    Value collapsed = tensor::CollapseShapeOp::create(
+                          rewriter, loc, unpackResult, reassociation)
+                          .getResult();
+
+    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, collapsed);
+    return success();
+  }
+};
+} // namespace
+
 void mlir::torch::torch_to_linalg::populateLinearPatternsAndLegality(
     TypeConverter &typeConverter, RewritePatternSet &patterns,
     ConversionTarget &target) {
@@ -2493,4 +3095,10 @@ void mlir::torch::torch_to_linalg::populateLinearPatternsAndLegality(
   patterns.add<ConvertAtenConvolutionBackwardOp>(typeConverter, context);
   target.addIllegalOp<AtenFftRfftOp>();
   patterns.add<ConvertAtenFftRfftOp>(typeConverter, context);
+  target.addIllegalOp<Torch::BlockDequantMatMulOp>();
+  patterns.add<ConvertBlockDequantMatMulOp>(typeConverter, context);
+  target.addIllegalOp<Torch::BlockQuantMatMulOp>();
+  patterns.add<ConvertBlockQuantMatMulOp>(typeConverter, context);
+  target.addIllegalOp<Torch::SubByteUnpackOp>();
+  patterns.add<ConvertSubByteUnpackOp>(typeConverter, context);
 }

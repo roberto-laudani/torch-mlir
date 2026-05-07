@@ -13475,6 +13475,91 @@ public:
 
 } // namespace
 
+// Decomposes torch.matmul_n_bits into either:
+//   - torch.block_dequant_matmul (accuracy_level 0-3: float path)
+//   - torch.block_quant_matmul   (accuracy_level 4: int8 path)
+namespace {
+/// Build a `torch.sub_byte_unpack` of `input` with the given `bits` attribute,
+/// inferring the result type from the input dtype and the caller-supplied
+/// `resultShape`. Uses `createOrFold` so the bits=8 identity case folds away.
+static Value createSubByteUnpack(PatternRewriter &rewriter, Location loc,
+                                 Value input, int64_t bits,
+                                 ArrayRef<int64_t> resultShape) {
+  auto inputType = cast<Torch::ValueTensorType>(input.getType());
+  auto resultType = inputType.getWithSizesAndDtype(
+      resultShape, inputType.getOptionalDtype());
+  auto si64Type =
+      IntegerType::get(rewriter.getContext(), 64, IntegerType::Signed);
+  auto bitsAttr = IntegerAttr::get(si64Type, bits);
+  return rewriter.createOrFold<Torch::SubByteUnpackOp>(loc, resultType, input,
+                                                      bitsAttr);
+}
+
+class DecomposeMatMulNBitsOp : public OpRewritePattern<MatMulNBitsOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(MatMulNBitsOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+    Value zeroPoints = op.getZeroPoints();
+
+    int64_t accuracyLevel = op.getAccuracyLevel();
+    int64_t bits = op.getBits();
+    int64_t blockSize = op.getBlockSize();
+
+    auto rhsType = cast<Torch::ValueTensorType>(op.getRhs().getType());
+    int64_t N = rhsType.getSizes()[0];
+    int64_t KB = rhsType.getSizes()[1];
+
+    // Unpack rhs: (N, KB, blob_size) ui8 -> (N, KB, block_size) ui8.
+    Value rhsUnpacked = createSubByteUnpack(rewriter, loc, op.getRhs(), bits,
+                                            {N, KB, blockSize});
+
+    // Normalize zero_points so the lowering always sees a (N, KB) tensor:
+    //  - integer (sub-byte-packed): unpack to (N, KB) ui8
+    //  - per-block float ZP: pass through unchanged
+    //  - None: materialize default 2^(bits-1) as a (N, KB) ui8 literal
+    if (isa<Torch::NoneType>(zeroPoints.getType())) {
+      auto ui8Type = IntegerType::get(ctx, 8, IntegerType::Unsigned);
+      auto defaultZpType =
+          Torch::ValueTensorType::get(ctx, ArrayRef<int64_t>{N, KB}, ui8Type);
+      auto denseAttr =
+          DenseElementsAttr::get(defaultZpType.toBuiltinTensor(),
+                                 static_cast<uint8_t>(1 << (bits - 1)));
+      zeroPoints = Torch::ValueTensorLiteralOp::create(
+          rewriter, loc, defaultZpType, denseAttr);
+    } else {
+      auto zpType = cast<Torch::ValueTensorType>(zeroPoints.getType());
+      if (!isa<mlir::FloatType>(zpType.getDtype())) {
+        // Integer ZP is sub-byte packed along KB with last dim
+        // ceil(KB*bits/8). Unpacking via torch.sub_byte_unpack multiplies the
+        // last dim by 8/bits exactly.
+        if (!ShapedType::isDynamic(KB) && (KB * bits) % 8 != 0)
+          return rewriter.notifyMatchFailure(
+              op, "integer zero_points: KB*bits must be a multiple of 8 to "
+                  "unpack cleanly to (N, KB)");
+        zeroPoints =
+            createSubByteUnpack(rewriter, loc, zeroPoints, bits, {N, KB});
+      }
+    }
+
+    if (accuracyLevel < 4) {
+      // ORT dispatches levels 0-3 to the same native-lhs-dtype compute path.
+      rewriter.replaceOpWithNewOp<Torch::BlockDequantMatMulOp>(
+          op, op.getType(), op.getLhs(), rhsUnpacked, op.getScales(),
+          zeroPoints, op.getBias());
+    } else {
+      // Level 4: dynamically quantize lhs to int8.
+      rewriter.replaceOpWithNewOp<Torch::BlockQuantMatMulOp>(
+          op, op.getType(), op.getLhs(), rhsUnpacked, op.getScales(),
+          zeroPoints, op.getBias(), bits);
+    }
+    return success();
+  }
+};
+} // namespace
+
 namespace {
 class DecomposeComplexOpsPass
     : public impl::DecomposeComplexOpsBase<DecomposeComplexOpsPass> {
@@ -13811,6 +13896,7 @@ public:
     addPatternIfTargetOpIsIllegal<DecomposeAtenRoundDecimalsOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenAsStridedOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeQuantizedMatmulOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeMatMulNBitsOp>(patterns);
 
     GreedyRewriteConfig config;
     config.setUseTopDownTraversal(true);

@@ -85,6 +85,25 @@ static RMSNormResult buildRMSNorm(OpBinder &binder,
 
   return {output, meanSq, invStdVar};
 }
+
+/// If input is 1D, reshape it to (n, size/n). None or already-2D inputs pass
+/// through unchanged. ONNX MatMulNBits allows scales and zero_points to be
+/// flattened.
+static Value promote1DTo2D(ConversionPatternRewriter &rewriter, Location loc,
+                           Value input, int64_t n) {
+  auto inputTy = dyn_cast<Torch::ValueTensorType>(input.getType());
+  if (!inputTy || !inputTy.hasSizes() || inputTy.getSizes().size() != 1)
+    return input;
+  assert(inputTy.getSizes()[0] % n == 0 &&
+         "promote1DTo2D: input size must be divisible by n");
+  int64_t inner = inputTy.getSizes()[0] / n;
+  Value shape = Torch::toIntListConstruct(rewriter, loc, {n, inner});
+  return Torch::AtenReshapeOp::create(
+      rewriter, loc,
+      inputTy.getWithSizesAndDtype(ArrayRef<int64_t>{n, inner},
+                                   inputTy.getOptionalDtype()),
+      input, shape);
+}
 } // namespace
 
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
@@ -1421,6 +1440,53 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
                                                    cTy, c, cScale, cZp, dtyVal);
         rewriter.replaceOpWithNewOp<Torch::AtenIntReprOp>(binder.op, resultType,
                                                           c);
+        return success();
+      });
+  patterns.onOp(
+      "MatMulNBits", 1,
+      [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        Location loc = binder.getLoc();
+        int64_t k, n, accuracyLevel, bits, blockSize;
+        Value lhs, rhs, scales, zeroPoints, bias;
+        if (binder.tensorOperandAtIndex(lhs, 0) ||
+            binder.tensorOperandAtIndex(rhs, 1) ||
+            binder.tensorOperandAtIndex(scales, 2) ||
+            binder.s64IntegerAttr(k, "K") || binder.s64IntegerAttr(n, "N") ||
+            binder.s64IntegerAttr(accuracyLevel, "accuracy_level", 0) ||
+            binder.s64IntegerAttr(bits, "bits") ||
+            binder.s64IntegerAttr(blockSize, "block_size"))
+          return rewriter.notifyMatchFailure(
+              binder.op, "Failed to get required input and attribute values");
+
+        Torch::ValueTensorType resultType;
+        if (binder.tensorResultType(resultType))
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "Result type bind failure");
+
+        if (failed(binder.tensorOperandAtIndex(zeroPoints, 3)))
+          zeroPoints = Torch::ConstantNoneOp::create(rewriter, loc);
+
+        // Index 4 (`g_idx`) is deprecated in ORT.
+        Value gIdx;
+        if (succeeded(binder.tensorOperandAtIndex(gIdx, 4)))
+          return rewriter.notifyMatchFailure(
+              binder.op, "Deprecated: `g_idx`");
+
+        if (failed(binder.tensorOperandAtIndex(bias, 5)))
+          bias = Torch::ConstantNoneOp::create(rewriter, loc);
+
+        // scales and zero_points may be 1D-flattened per ONNX spec.
+        // downstream lowerings expect the 2D form.
+        scales = promote1DTo2D(rewriter, loc, scales, n);
+        zeroPoints = promote1DTo2D(rewriter, loc, zeroPoints, n);
+
+        MLIRContext *context = rewriter.getContext();
+        auto si64Type = IntegerType::get(context, 64, IntegerType::Signed);
+        rewriter.replaceOpWithNewOp<Torch::MatMulNBitsOp>(
+            binder.op, resultType, lhs, rhs, scales, zeroPoints, bias,
+            IntegerAttr::get(si64Type, accuracyLevel),
+            IntegerAttr::get(si64Type, bits),
+            IntegerAttr::get(si64Type, blockSize));
         return success();
       });
 }
