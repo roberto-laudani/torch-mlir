@@ -6114,6 +6114,85 @@ void AtenConvolutionOp::getCanonicalizationPatterns(RewritePatternSet &results,
 }
 
 //===----------------------------------------------------------------------===//
+// QuantizedMatmulOp
+//===----------------------------------------------------------------------===//
+
+// Replace zero-point operands that are constant splats of 0 with
+// torch.constant.none, so the lowering can skip emitting the subtraction.
+static bool isZeroSplat(Value v) {
+  auto literalOp = v.getDefiningOp<Torch::ValueTensorLiteralOp>();
+  if (!literalOp)
+    return false;
+  auto attr = dyn_cast<DenseIntElementsAttr>(literalOp.getValue());
+  if (!attr || !attr.isSplat())
+    return false;
+  return attr.getSplatValue<APInt>().isZero();
+}
+
+void QuantizedMatmulOp::getCanonicalizationPatterns(
+    RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add(+[](QuantizedMatmulOp op, PatternRewriter &rewriter) {
+    bool lhsZpIsZero = isZeroSplat(op.getLhsZeroPoint());
+    bool rhsZpIsZero = isZeroSplat(op.getRhsZeroPoint());
+    if (!lhsZpIsZero && !rhsZpIsZero)
+      return failure();
+
+    Value none = ConstantNoneOp::create(rewriter, op.getLoc());
+    Value lhsZp = lhsZpIsZero ? none : op.getLhsZeroPoint();
+    Value rhsZp = rhsZpIsZero ? none : op.getRhsZeroPoint();
+    rewriter.replaceOpWithNewOp<QuantizedMatmulOp>(
+        op, op.getType(), op.getLhs(), op.getRhs(), lhsZp, rhsZp);
+    return success();
+  });
+}
+
+LogicalResult QuantizedMatmulOp::verify() {
+  auto lhsType = cast<BaseTensorType>(getLhs().getType());
+  auto rhsType = cast<BaseTensorType>(getRhs().getType());
+
+  if (lhsType.hasSizes() && rhsType.hasSizes()) {
+    int64_t lhsRank = lhsType.getSizes().size();
+    int64_t rhsRank = rhsType.getSizes().size();
+    if (lhsRank < 2 || rhsRank < 2)
+      return emitOpError(
+                 "expected lhs and rhs to be at least rank 2, got ranks ")
+             << lhsRank << " and " << rhsRank;
+    if (lhsRank != rhsRank && rhsRank != 2)
+      return emitOpError("rank broadcast is only supported when rhs is rank 2, "
+                         "got lhs rank ")
+             << lhsRank << " and rhs rank " << rhsRank;
+  }
+
+  if (lhsType.hasDtype() && !isa<IntegerType>(lhsType.getDtype()))
+    return emitOpError("expected integer element type for lhs, got ")
+           << lhsType.getDtype();
+  if (rhsType.hasDtype() && !isa<IntegerType>(rhsType.getDtype()))
+    return emitOpError("expected integer element type for rhs, got ")
+           << rhsType.getDtype();
+
+  auto verifyZeroPoint = [&](Value zp, StringRef name) -> LogicalResult {
+    if (isa<Torch::NoneType>(zp.getType()))
+      return success();
+    auto zpType = cast<BaseTensorType>(zp.getType());
+    if (zpType.hasSizes() && zpType.getSizes().size() > 1)
+      return emitOpError(name)
+             << " zero point must be rank 0 or 1, got rank "
+             << zpType.getSizes().size();
+    if (zpType.hasDtype() && !isa<IntegerType>(zpType.getDtype()))
+      return emitOpError(name)
+             << " zero point must have integer element type, got "
+             << zpType.getDtype();
+    return success();
+  };
+  if (failed(verifyZeroPoint(getLhsZeroPoint(), "lhs")))
+    return failure();
+  if (failed(verifyZeroPoint(getRhsZeroPoint(), "rhs")))
+    return failure();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // AtenLinalgCrossOp
 //===----------------------------------------------------------------------===//
 

@@ -3651,3 +3651,33 @@ func.func @torch.aten.convolution.single_int_tuple(%arg0: !torch.vtensor<[1,1,5,
     %6 = torch.aten.convolution %arg0, %w, %b, %stride, %padding, %dilation, %true, %output_padding, %int1 : !torch.vtensor<[1,1,5,5],f32>, !torch.vtensor<[1,1,1,1],f32>, !torch.vtensor<[1],f32>, !torch.list<int>, !torch.list<int>, !torch.list<int>, !torch.bool, !torch.list<int>, !torch.int -> !torch.vtensor<[1,1,5,5],f32>
     return %6 : !torch.vtensor<[1,1,5,5],f32>
 }
+
+// -----
+
+// Zero-splat zero points in quantized_matmul are replaced with none.
+// CHECK-LABEL: func.func @torch.quantized_matmul.fold_zero_zp
+// CHECK: %[[NONE:.*]] = torch.constant.none
+// CHECK: torch.quantized_matmul %arg0, %arg1, %[[NONE]], %[[NONE]]
+func.func @torch.quantized_matmul.fold_zero_zp(
+    %lhs: !torch.vtensor<[4,3],si8>,
+    %rhs: !torch.vtensor<[3,2],si8>) -> !torch.vtensor<[4,2],si32> {
+  %lhs_zp = torch.vtensor.literal(dense<0> : tensor<si8>) : !torch.vtensor<[],si8>
+  %rhs_zp = torch.vtensor.literal(dense<0> : tensor<1024xsi8>) : !torch.vtensor<[1024],si8>
+  %0 = torch.quantized_matmul %lhs, %rhs, %lhs_zp, %rhs_zp : !torch.vtensor<[4,3],si8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],si8>, !torch.vtensor<[1024],si8> -> !torch.vtensor<[4,2],si32>
+  return %0 : !torch.vtensor<[4,2],si32>
+}
+
+// -----
+
+// Non-zero zero points are not folded away.
+// CHECK-LABEL: func.func @torch.quantized_matmul.keep_nonzero_zp
+// CHECK-NOT: torch.constant.none
+// CHECK: torch.quantized_matmul %arg0, %arg1, %{{.*}}, %{{.*}} : {{.*}} !torch.vtensor<[],ui8>, !torch.vtensor<[],si8>
+func.func @torch.quantized_matmul.keep_nonzero_zp(
+    %lhs: !torch.vtensor<[4,3],ui8>,
+    %rhs: !torch.vtensor<[3,2],si8>) -> !torch.vtensor<[4,2],si32> {
+  %lhs_zp = torch.vtensor.literal(dense<126> : tensor<ui8>) : !torch.vtensor<[],ui8>
+  %rhs_zp = torch.vtensor.literal(dense<3> : tensor<si8>) : !torch.vtensor<[],si8>
+  %0 = torch.quantized_matmul %lhs, %rhs, %lhs_zp, %rhs_zp : !torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[],si8> -> !torch.vtensor<[4,2],si32>
+  return %0 : !torch.vtensor<[4,2],si32>
+}

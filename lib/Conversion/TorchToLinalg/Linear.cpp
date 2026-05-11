@@ -2476,6 +2476,214 @@ struct ConvertAtenFftRfftOp final : OpConversionPattern<AtenFftRfftOp> {
   }
 };
 
+struct ZeroPoint {
+  Value value;
+  int64_t rank;
+  bool isUnsigned;
+};
+
+// Build a ZeroPoint for one operand. Returns nullopt if the original operand
+// is a torch.none.
+static std::optional<ZeroPoint>
+buildZeroPoint(OpBuilder &builder, Location loc,
+               const TypeConverter &typeConverter, Value origZp,
+               Value adaptorZp) {
+  Type torchType = origZp.getType();
+  if (isa<Torch::NoneType>(torchType))
+    return std::nullopt;
+  Value materialized = typeConverter.materializeTargetConversion(
+      builder, loc, typeConverter.convertType(torchType), adaptorZp);
+  return ZeroPoint{
+      materialized, cast<RankedTensorType>(materialized.getType()).getRank(),
+      torch_to_linalg::isUnsignedTorchType(cast<ValueTensorType>(torchType))};
+}
+
+// Append a zero-point operand to a linalg.generic input list with the
+// matching indexing map. nullopt -> no-op; rank-0 -> map to (); rank-1 ->
+// map to the supplied per-channel dim expression.
+static void maybeAddZpInput(SmallVectorImpl<AffineMap> &indexingMaps,
+                            SmallVectorImpl<Value> &inputs, unsigned numDims,
+                            MLIRContext *ctx,
+                            const std::optional<ZeroPoint> &zp,
+                            AffineExpr perChannelExpr) {
+  if (!zp)
+    return;
+  SmallVector<AffineExpr> zpExprs;
+  if (zp->rank == 1)
+    zpExprs.push_back(perChannelExpr);
+  indexingMaps.push_back(AffineMap::get(numDims, 0, zpExprs, ctx));
+  inputs.push_back(zp->value);
+}
+
+struct ConvertQuantizedMatmulOp final
+    : public OpConversionPattern<QuantizedMatmulOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(QuantizedMatmulOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    Value lhs = adaptor.getLhs();
+    Value rhs = adaptor.getRhs();
+
+    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
+      return failure();
+
+    auto lhsType = cast<RankedTensorType>(lhs.getType());
+    auto rhsType = cast<RankedTensorType>(rhs.getType());
+    unsigned lhsRank = lhsType.getRank();
+    unsigned rhsRank = rhsType.getRank();
+
+    auto lhsTorchType = cast<ValueTensorType>(op.getLhs().getType());
+    auto rhsTorchType = cast<ValueTensorType>(op.getRhs().getType());
+    bool lhsUnsigned = torch_to_linalg::isUnsignedTorchType(lhsTorchType);
+    bool rhsUnsigned = torch_to_linalg::isUnsignedTorchType(rhsTorchType);
+
+    auto resultType =
+        cast<RankedTensorType>(getTypeConverter()->convertType(op.getType()));
+    auto i32Type = rewriter.getI32Type();
+
+    // Zero points can be: None, scalar (rank-0), or per-channel (rank-1).
+    std::optional<ZeroPoint> lhsZp =
+        buildZeroPoint(rewriter, loc, *typeConverter, op.getLhsZeroPoint(),
+                       adaptor.getLhsZeroPoint());
+    std::optional<ZeroPoint> rhsZp =
+        buildZeroPoint(rewriter, loc, *typeConverter, op.getRhsZeroPoint(),
+                       adaptor.getRhsZeroPoint());
+
+    // Handle rank mismatch: if only one side has batch dims, collapse
+    // the batched operand's leading dims into M (for lhs) or K (for rhs),
+    // making both operands rank 2. The result is expanded back afterwards.
+    SmallVector<ReassociationIndices> collapseReassociation;
+    SmallVector<Value> expandedResultShape;
+    if (lhsRank != rhsRank) {
+      // In quantized matmul patterns from ONNX, the weight (rhs) is always
+      // rank 2 while the activation (lhs) may carry batch dimensions.
+      // Collapse lhs [B..., M, K] -> [B*...*M, K]
+      unsigned origLhsRank = lhsRank;
+      ReassociationIndices leadingDims;
+      for (unsigned i = 0; i < origLhsRank - 1; i++)
+        leadingDims.push_back(i);
+      collapseReassociation.push_back(leadingDims);
+      collapseReassociation.push_back({static_cast<int64_t>(origLhsRank - 1)});
+
+      // Save original leading dims for expanding result later.
+      for (unsigned i = 0; i < origLhsRank - 1; i++)
+        expandedResultShape.push_back(getDimOp(rewriter, loc, lhs, i));
+
+      lhs = tensor::CollapseShapeOp::create(rewriter, loc, lhs,
+                                            collapseReassociation);
+      lhsType = cast<RankedTensorType>(lhs.getType());
+      lhsRank = 2;
+    }
+
+    // Build iterator types and affine maps.
+    // For rank-2: dims are (m, n, k) -> parallel, parallel, reduction
+    // For rank-N: dims are (b0..bN-2, m, n, k) with batch dims parallel
+    unsigned batchRank = lhsRank - 2;
+    unsigned numDims = batchRank + 3; // batch + m + n + k
+
+    SmallVector<utils::IteratorType> iteratorTypes(
+        batchRank + 2, utils::IteratorType::parallel);
+    iteratorTypes.push_back(utils::IteratorType::reduction);
+
+    // Dimension indices
+    SmallVector<AffineExpr> batchExprs;
+    batchExprs.reserve(batchRank);
+    for (unsigned i = 0; i < batchRank; i++)
+      batchExprs.push_back(rewriter.getAffineDimExpr(i));
+    auto mExpr = rewriter.getAffineDimExpr(batchRank);
+    auto nExpr = rewriter.getAffineDimExpr(batchRank + 1);
+    auto kExpr = rewriter.getAffineDimExpr(batchRank + 2);
+
+    // lhs: (b..., m, k)
+    SmallVector<AffineExpr> lhsExprs(batchExprs);
+    lhsExprs.append({mExpr, kExpr});
+
+    // rhs: (b..., k, n)
+    SmallVector<AffineExpr> rhsExprs(batchExprs);
+    rhsExprs.append({kExpr, nExpr});
+
+    // output: (b..., m, n)
+    SmallVector<AffineExpr> outExprs(batchExprs);
+    outExprs.append({mExpr, nExpr});
+
+    SmallVector<AffineMap> indexingMaps;
+    indexingMaps.push_back(
+        AffineMap::get(numDims, 0, lhsExprs, rewriter.getContext()));
+    indexingMaps.push_back(
+        AffineMap::get(numDims, 0, rhsExprs, rewriter.getContext()));
+
+    SmallVector<Value> inputs = {lhs, rhs};
+
+    // Zero point maps: scalar -> (), per-channel -> (m) for lhs / (n) for rhs.
+    maybeAddZpInput(indexingMaps, inputs, numDims, rewriter.getContext(), lhsZp,
+                    mExpr);
+    maybeAddZpInput(indexingMaps, inputs, numDims, rewriter.getContext(), rhsZp,
+                    nExpr);
+
+    // Output map
+    indexingMaps.push_back(
+        AffineMap::get(numDims, 0, outExprs, rewriter.getContext()));
+
+    // Create zero-initialized output tensor
+    SmallVector<Value> resultDims;
+    for (unsigned i = 0; i < batchRank; i++)
+      resultDims.push_back(getDimOp(rewriter, loc, lhs, i));
+    resultDims.push_back(getDimOp(rewriter, loc, lhs, lhsRank - 2)); // M
+    resultDims.push_back(getDimOp(rewriter, loc, rhs, rhsRank - 1)); // N
+
+    Value zeroTensor = createZeroInitTensor(rewriter, loc, resultDims, i32Type);
+
+    Value generic =
+        linalg::GenericOp::create(
+            rewriter, loc, zeroTensor.getType(), inputs, zeroTensor,
+            indexingMaps, iteratorTypes,
+            [&](OpBuilder &b, Location loc, ValueRange args) {
+              auto extToI32 = [&](Value v, bool isUnsigned) -> Value {
+                if (v.getType() == i32Type)
+                  return v;
+                if (isUnsigned)
+                  return arith::ExtUIOp::create(b, loc, i32Type, v);
+                return arith::ExtSIOp::create(b, loc, i32Type, v);
+              };
+
+              unsigned idx = 2;
+              Value lhsExt = extToI32(args[0], lhsUnsigned);
+              Value rhsExt = extToI32(args[1], rhsUnsigned);
+
+              if (lhsZp) {
+                Value zpExt = extToI32(args[idx++], lhsZp->isUnsigned);
+                lhsExt = arith::SubIOp::create(b, loc, lhsExt, zpExt);
+              }
+              if (rhsZp) {
+                Value zpExt = extToI32(args[idx++], rhsZp->isUnsigned);
+                rhsExt = arith::SubIOp::create(b, loc, rhsExt, zpExt);
+              }
+
+              Value mul = arith::MulIOp::create(b, loc, lhsExt, rhsExt);
+              Value acc = args.back();
+              Value add = arith::AddIOp::create(b, loc, mul, acc);
+              linalg::YieldOp::create(b, loc, add);
+            })
+            .getResult(0);
+
+    // If we collapsed batch dims, expand the result back.
+    if (!collapseReassociation.empty()) {
+      // N dim from the generic result.
+      expandedResultShape.push_back(
+          getDimOp(rewriter, loc, generic, /*dim=*/1));
+      SmallVector<OpFoldResult> outputShape =
+          getAsOpFoldResult(expandedResultShape);
+      generic =
+          tensor::ExpandShapeOp::create(rewriter, loc, resultType, generic,
+                                        collapseReassociation, outputShape);
+    }
+
+    rewriter.replaceOp(op, generic);
+    return success();
+  }
+};
+
 } // namespace
 
 namespace {
@@ -3101,4 +3309,6 @@ void mlir::torch::torch_to_linalg::populateLinearPatternsAndLegality(
   patterns.add<ConvertBlockQuantMatMulOp>(typeConverter, context);
   target.addIllegalOp<Torch::SubByteUnpackOp>();
   patterns.add<ConvertSubByteUnpackOp>(typeConverter, context);
+  target.addIllegalOp<QuantizedMatmulOp>();
+  patterns.add<ConvertQuantizedMatmulOp>(typeConverter, context);
 }

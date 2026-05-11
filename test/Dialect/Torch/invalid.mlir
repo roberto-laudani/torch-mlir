@@ -403,3 +403,38 @@ func.func @torch.symbolic_int$no_shape_symbols(%arg0: !torch.vtensor<[?],f32>) -
   torch.bind_symbolic_shape %arg0, [%int0], affine_map<()[s0] -> (s0)> : !torch.vtensor<[?],f32>
   return %arg0 : !torch.vtensor<[?],f32>
 }
+
+// -----
+
+func.func @torch.quantized_matmul$rank1_rejected(
+    %lhs: !torch.vtensor<[4],si8>,
+    %rhs: !torch.vtensor<[4],si8>) -> !torch.vtensor<[4],si32> {
+  %none = torch.constant.none
+  // expected-error @+1 {{'torch.quantized_matmul' op expected lhs and rhs to be at least rank 2}}
+  %0 = torch.quantized_matmul %lhs, %rhs, %none, %none : !torch.vtensor<[4],si8>, !torch.vtensor<[4],si8>, !torch.none, !torch.none -> !torch.vtensor<[4],si32>
+  return %0 : !torch.vtensor<[4],si32>
+}
+
+// -----
+
+func.func @torch.quantized_matmul$broadcast_rhs_not_rank2(
+    %lhs: !torch.vtensor<[2,4,4,3],si8>,
+    %rhs: !torch.vtensor<[2,3,2],si8>,
+    %lhs_zp: !torch.vtensor<[],si8>) -> !torch.vtensor<[2,4,4,2],si32> {
+  %none = torch.constant.none
+  // expected-error @+1 {{'torch.quantized_matmul' op rank broadcast is only supported when rhs is rank 2}}
+  %0 = torch.quantized_matmul %lhs, %rhs, %lhs_zp, %none : !torch.vtensor<[2,4,4,3],si8>, !torch.vtensor<[2,3,2],si8>, !torch.vtensor<[],si8>, !torch.none -> !torch.vtensor<[2,4,4,2],si32>
+  return %0 : !torch.vtensor<[2,4,4,2],si32>
+}
+
+// -----
+
+func.func @torch.quantized_matmul$zp_rank2_rejected(
+    %lhs: !torch.vtensor<[4,3],si8>,
+    %rhs: !torch.vtensor<[3,2],si8>,
+    %lhs_zp: !torch.vtensor<[4,3],si8>) -> !torch.vtensor<[4,2],si32> {
+  %none = torch.constant.none
+  // expected-error @+1 {{'torch.quantized_matmul' op lhs zero point must be rank 0 or 1}}
+  %0 = torch.quantized_matmul %lhs, %rhs, %lhs_zp, %none : !torch.vtensor<[4,3],si8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[4,3],si8>, !torch.none -> !torch.vtensor<[4,2],si32>
+  return %0 : !torch.vtensor<[4,2],si32>
+}

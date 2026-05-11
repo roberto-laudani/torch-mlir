@@ -1456,8 +1456,8 @@ def Torch_QuantizedMatmulOp: Torch_Op<"quantized_matmul", [
 
     Computes: Y = (A - a_zero_point) @ (B - b_zero_point) -> int32
 
-    For UINT8 inputs, uses XOR with 0x80 to convert to INT8, then applies
-    correction terms. Zero points are optional. If not provided, assumed to be 0.
+    Zero points are optional. If not provided, assumed to be 0.
+    Supports both signed and unsigned integer types.
   }];
   let arguments = (ins
     AnyTorchTensorType:$lhs,
@@ -1472,6 +1472,8 @@ def Torch_QuantizedMatmulOp: Torch_Op<"quantized_matmul", [
     $lhs `,` $rhs `,` $lhs_zero_point `,` $rhs_zero_point attr-dict
     `:` type($lhs) `,` type($rhs) `,` type($lhs_zero_point) `,` type($rhs_zero_point) `->` type($result)
   }];
+  let hasCanonicalizer = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
