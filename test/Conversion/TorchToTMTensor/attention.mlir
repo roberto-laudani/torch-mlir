@@ -63,7 +63,9 @@ func.func @test_group_query_attention_scaled(
   // CHECK-DAG: %[[INIT_TENSOR:.*]] = tensor.empty
   // CHECK-DAG: %[[FILL_CST:.*]] = arith.constant 0.000000e+00 : f32
   // CHECK-DAG: %[[FILL_OUT:.*]] = linalg.fill ins(%[[FILL_CST]] : f32) outs(%[[INIT_TENSOR]] : tensor<?x?x8xf32>) -> tensor<?x?x8xf32>
-  // CHECK-DAG: %[[ATTN:.+]] = tm_tensor.attention {scale = 0.088388346135616302 : f64} ins(%[[Q_IN:.+]], %[[K_IN:.+]], %[[V_IN:.+]] : tensor<?x?x8xf32>, tensor<?x?x8xf32>, tensor<?x?x8xf32>) outs(%[[FILL_OUT]] : tensor<?x?x8xf32>) -> tensor<?x?x8xf32>
+  // scale = 1/sqrt(8) ≈ 0.353553. The lowering requires this to match
+  // 1/sqrt(headDim); see torch-mlir #4419.
+  // CHECK-DAG: %[[ATTN:.+]] = tm_tensor.attention {scale = 0.35355339059327379 : f64} ins(%[[Q_IN:.+]], %[[K_IN:.+]], %[[V_IN:.+]] : tensor<?x?x8xf32>, tensor<?x?x8xf32>, tensor<?x?x8xf32>) outs(%[[FILL_OUT]] : tensor<?x?x8xf32>) -> tensor<?x?x8xf32>
   // CHECK-DAG: %[[Q_IN]] = tensor.collapse_shape %{{.*}} {{\[\[}}0, 1], [2], [3]] : tensor<?x2x?x8xf32> into tensor<?x?x8xf32>
   // CHECK-DAG: %[[K_IN]] = tensor.collapse_shape %{{.*}} {{\[\[}}0, 1], [2], [3]] : tensor<?x2x?x8xf32> into tensor<?x?x8xf32>
   // CHECK-DAG: %[[V_IN]] = tensor.collapse_shape %{{.*}} {{\[\[}}0, 1], [2], [3]] : tensor<?x2x?x8xf32> into tensor<?x?x8xf32>
@@ -86,8 +88,8 @@ func.func @test_group_query_attention_scaled(
   %false = torch.constant.bool false
   %true = torch.constant.bool true
   %float0.000000e00 = torch.constant.float 0.000000e+00
-  %float8.838830e-02 = torch.constant.float 0.088388346135616302
-  %7 = torch.aten.scaled_dot_product_attention %3, %5, %6, %none, %float0.000000e00, %false, %float8.838830e-02, %true : !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.none, !torch.float, !torch.bool, !torch.float, !torch.bool -> !torch.vtensor<[?,2,?,8],f32>
+  %scale = torch.constant.float 0.35355339059327379
+  %7 = torch.aten.scaled_dot_product_attention %3, %5, %6, %none, %float0.000000e00, %false, %scale, %true : !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.none, !torch.float, !torch.bool, !torch.float, !torch.bool -> !torch.vtensor<[?,2,?,8],f32>
   %8 = torch.prim.ListConstruct %int-1, %int-1_0, %int16 : (!torch.int, !torch.int, !torch.int) -> !torch.list<int>
   %9 = torch.aten.reshape %7, %8 : !torch.vtensor<[?,2,?,8],f32>, !torch.list<int> -> !torch.vtensor<[?,?,16],f32>
   return %9, %arg3, %arg4 : !torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>

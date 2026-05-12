@@ -277,7 +277,7 @@ gentbl_cc_library(
             [
                 "-gen-pass-decls",
                 "-DTORCH_MLIR_ENABLE_STABLEHLO",
-                #"-DTORCH_MLIR_ENABLE_TOSA",
+                "-DTORCH_MLIR_ENABLE_TOSA",
             ],
             "include/torch-mlir/Conversion/Passes.h.inc",
         ),
@@ -344,7 +344,7 @@ gentbl_cc_library(
             [
                 "-gen-pass-decls",
                 "-DTORCH_MLIR_ENABLE_STABLEHLO",
-                #"-DTORCH_MLIR_ENABLE_TOSA",
+                "-DTORCH_MLIR_ENABLE_TOSA",
             ],
             "include/torch-mlir/Dialect/TorchConversion/Transforms/Passes.h.inc",
         ),
@@ -568,7 +568,7 @@ cc_library(
     ],
     defines = [
         "TORCH_MLIR_ENABLE_STABLEHLO",
-        #"TORCH_MLIR_ENABLE_TOSA",
+        "TORCH_MLIR_ENABLE_TOSA",
     ],
     strip_include_prefix = "include",
     deps = [
@@ -580,7 +580,7 @@ cc_library(
         ":TorchMLIRTorchToStablehlo",
         ":TorchMLIRTorchToTMTensor",
         ":TorchMLIRTorchToTensor",
-        #       ":TorchMLIRTorchToTosa",
+        ":TorchMLIRTorchToTosa",
     ],
 )
 
@@ -593,7 +593,7 @@ cc_library(
     hdrs = glob(["include/torch-mlir/Dialect/TorchConversion/Transforms/*.h"]),
     defines = [
         "TORCH_MLIR_ENABLE_STABLEHLO",
-        #"TORCH_MLIR_ENABLE_TOSA",
+        "TORCH_MLIR_ENABLE_TOSA",
     ],
     strip_include_prefix = "include",
     deps = [
@@ -609,7 +609,7 @@ cc_library(
         ":TorchMLIRTorchToStablehlo",
         ":TorchMLIRTorchToTMTensor",
         ":TorchMLIRTorchToTensor",
-        #       ":TorchMLIRTorchToTosa",
+        ":TorchMLIRTorchToTosa",
         "@llvm-project//mlir:ControlFlowTransforms",
         "@llvm-project//mlir:ConversionPasses",
         "@llvm-project//mlir:FuncDialect",
@@ -632,7 +632,7 @@ cc_library(
         "include/torch-mlir/Conversion/Passes.h",
     ],
     defines = [
-        #"TORCH_MLIR_ENABLE_TOSA",
+        "TORCH_MLIR_ENABLE_TOSA",
     ],
     strip_include_prefix = "include",
     deps = [
