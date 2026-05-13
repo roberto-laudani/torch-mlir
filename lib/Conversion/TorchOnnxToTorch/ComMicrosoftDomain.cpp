@@ -104,6 +104,78 @@ static Value promote1DTo2D(ConversionPatternRewriter &rewriter, Location loc,
                                    inputTy.getOptionalDtype()),
       input, shape);
 }
+
+/// When key and value are None, the query operand carries a packed QKV tensor
+/// of shape [batch, seq, (num_heads + 2*kv_num_heads) * head_size].
+/// Split it into separate Q, K, V tensors and reassign the references.
+/// Returns failure if the input is invalid.
+static LogicalResult splitPackedQKV(OpBinder &binder,
+                                    ConversionPatternRewriter &rewriter,
+                                    int64_t numHeads, int64_t kvNumHeads,
+                                    Value &query, Value &key, Value &value) {
+  Location loc = binder.getLoc();
+  MLIRContext *context = binder.op->getContext();
+
+  auto packedType = cast<Torch::ValueTensorType>(query.getType());
+  if (!packedType.hasSizes() || packedType.getSizes().size() != 3)
+    return rewriter.notifyMatchFailure(binder.op,
+                                       "Expected packed QKV input to be rank-3 "
+                                       "[batch, seq, hidden]");
+
+  if (packedType.getSizes()[2] == ShapedType::kDynamic)
+    return rewriter.notifyMatchFailure(
+        binder.op,
+        "Expected packed QKV input to have statically known hidden size");
+
+  if (!packedType.hasDtype())
+    return rewriter.notifyMatchFailure(
+        binder.op, "Expected packed QKV input to have a known dtype");
+
+  int64_t packedHiddenSize = packedType.getSizes()[2];
+  int64_t totalHeads = numHeads + 2 * kvNumHeads;
+  if (packedHiddenSize % totalHeads != 0)
+    return rewriter.notifyMatchFailure(binder.op,
+                                       "Packed hidden size not divisible by "
+                                       "(num_heads + 2*kv_num_heads)");
+
+  int64_t headSize = packedHiddenSize / totalHeads;
+  int64_t qHiddenSize = numHeads * headSize;
+  int64_t kvHiddenSize = kvNumHeads * headSize;
+  SmallVector<int64_t> packedDims{packedType.getSizes()};
+  Type elemDtype = packedType.getOptionalDtype();
+
+  Value cstQHidden = Torch::ConstantIntOp::create(
+      rewriter, loc, rewriter.getI64IntegerAttr(qHiddenSize));
+  Value cstKVHidden = Torch::ConstantIntOp::create(
+      rewriter, loc, rewriter.getI64IntegerAttr(kvHiddenSize));
+  Value splitSizesList = Torch::PrimListConstructOp::create(
+      rewriter, loc, Torch::ListType::get(Torch::IntType::get(context)),
+      SmallVector<Value>{cstQHidden, cstKVHidden, cstKVHidden});
+  Value cstSplitDim = Torch::ConstantIntOp::create(
+      rewriter, loc, rewriter.getI64IntegerAttr(2));
+
+  SmallVector<int64_t> splitElemDims{packedDims[0], packedDims[1],
+                                     Torch::kUnknownSize};
+  auto splitListType = Torch::ListType::get(
+      Torch::ValueTensorType::get(context, splitElemDims, elemDtype));
+  Value splitResult = Torch::AtenSplitWithSizesOp::create(
+      rewriter, loc, splitListType, query, splitSizesList, cstSplitDim);
+
+  SmallVector<int64_t> qSplitDims{packedDims[0], packedDims[1], qHiddenSize};
+  SmallVector<int64_t> kvSplitDims{packedDims[0], packedDims[1], kvHiddenSize};
+  auto qSplitType = Torch::ValueTensorType::get(context, qSplitDims, elemDtype);
+  auto kvSplitType =
+      Torch::ValueTensorType::get(context, kvSplitDims, elemDtype);
+
+  auto unpack = Torch::PrimListUnpackOp::create(
+      rewriter, loc, TypeRange{qSplitType, kvSplitType, kvSplitType},
+      splitResult);
+  query = unpack.getResult(0);
+  key = unpack.getResult(1);
+  value = unpack.getResult(2);
+  return success();
+}
+
 } // namespace
 
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
@@ -257,9 +329,8 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
             rewriter, loc, matMulIntTy, lhs, rhs, lhsZeroPoint, rhsZeroPoint);
 
         // Convert to float
-        Value matmulFloat =
-            Torch::convertTensorToDtype(rewriter, loc, matMulInt,
-                                        resultType.getDtype());
+        Value matmulFloat = Torch::convertTensorToDtype(
+            rewriter, loc, matMulInt, resultType.getDtype());
 
         // Compute scale product
         auto lhsScaleTy = lhsScale.getType();
@@ -281,13 +352,11 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         Value mulLhs = lhsScaleTensorTy ? lhsScale : rhsScale;
         Value mulRhs = lhsScaleTensorTy ? rhsScale : lhsScale;
         if (lhsScaleTensorTy && rhsScaleTensorTy)
-          scaleProduct = Torch::AtenMulTensorOp::create(rewriter, loc,
-                                                        scaleProdTy, mulLhs,
-                                                        mulRhs);
+          scaleProduct = Torch::AtenMulTensorOp::create(
+              rewriter, loc, scaleProdTy, mulLhs, mulRhs);
         else if (lhsScaleTensorTy || rhsScaleTensorTy)
-          scaleProduct = Torch::AtenMulScalarOp::create(rewriter, loc,
-                                                        scaleProdTy, mulLhs,
-                                                        mulRhs);
+          scaleProduct = Torch::AtenMulScalarOp::create(
+              rewriter, loc, scaleProdTy, mulLhs, mulRhs);
         else
           scaleProduct = Torch::AtenMulOp::create(rewriter, loc, lhsScaleTy,
                                                   lhsScale, rhsScale);
@@ -450,8 +519,6 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               binder.op, "Unimplemented: softcap attribute is not supported, "
                          "hence it should have default value equal to 0.0");
 
-        // TODO: Add support for packed_qkv.
-
         Location loc = binder.getLoc();
         MLIRContext *context = binder.op->getContext();
         Value query = operands[0];
@@ -465,6 +532,16 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         if (doRotary) {
           cosCache = operands[7];
           sinCache = operands[8];
+        }
+
+        // Packed QKV: when key and value are None, the query input contains
+        // all three projections concatenated along the last dimension.
+        // Split into separate Q, K, V tensors before proceeding.
+        if (isa<Torch::NoneType>(key.getType()) &&
+            isa<Torch::NoneType>(value.getType())) {
+          if (failed(splitPackedQKV(binder, rewriter, numHeads, kvNumHeads,
+                                    query, key, value)))
+            return failure();
         }
 
         Torch::ValueTensorType queryType =
@@ -582,39 +659,18 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
 
         Value qRotary = qInput, kRotary = kInput;
         if (doRotary) {
-          // `totalSequenceLength` is a scalar tensor.
-          Value scalarTotalSeqLens = Torch::AtenItemOp::create(
-              rewriter, loc, rewriter.getType<Torch::IntType>(),
-              totalSequenceLength);
+          // Generating position_ids for rotary_embedding:
+          //   past_seqlens = (seqlens_k + 1) - sequence_length
+          //   pos_ids = arange(sequence_length).repeat(batch_size, 1)
+          //          + past_seqlens.view(-1, 1)
+          //
+          // This works for all cases:
+          //   - Initial prompt (past=0): pos_ids = [0, 1, ..., seq-1]
+          //   - Decode (seq=1): pos_ids = [past_seq_len]
+          //   - Subsequent prompt: pos_ids = [past, past+1, ..., past+seq-1]
           Value cstIntOne = Torch::ConstantIntOp::create(
               rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(1));
-          Type boolTy = rewriter.getType<Torch::BoolType>();
-          Value condA = Torch::AtenGtIntOp::create(
-              rewriter, loc, boolTy, cstSequenceLength, cstIntOne);
-          Value condB = Torch::AtenNeIntOp::create(
-              rewriter, loc, boolTy, cstSequenceLength, scalarTotalSeqLens);
-          //   if (sequence_length > 1 && sequence_length !=
-          //   total_sequence_length)
-          //         is_subsequent_prompt = false;  // Subsequent prompt
-          Value isSubsequentPrompt = Torch::Aten__And__BoolOp::create(
-              rewriter, loc, boolTy, condA, condB);
 
-          // Generating position_ids for rotary_embedding as follows:
-          //   pos_ids_a = torch.zeros((batch_size, seq_len), dtype=torch.int64)
-          //
-          //   total_seqlens = seqlens_k + 1
-          //   past_seqlens = total_seqlens - sequence_length
-          //   pos_ids = torch.arange(sequence_length,
-          //             dtype=torch.int64).repeat(batch_size, 1)
-          //   pos_ids = pos_ids + past_seqlens.view(-1, 1)
-          //   cond = pos_ids < total_seqlens.view(-1, 1)
-          //   one_tensor = torch.tensor(1, dtype=torch.int64)
-          //   pos_ids_b = torch.where(cond, pos_ids, one_tensor)
-          //
-          //  if subsequent_prompt:
-          //      pos_ids = pos_ids_b
-          //  else:
-          //      pos_ids = pos_ids_a
           SmallVector<int64_t> positionIdsSizeInt{batchSize, sequenceLength};
           Torch::ValueTensorType positionIdsType = Torch::ValueTensorType::get(
               context, positionIdsSizeInt,
@@ -633,26 +689,13 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               rewriter, binder.getLoc(), rewriter.getType<Torch::FloatType>(),
               rewriter.getF64FloatAttr(1.0));
 
-          Value positionIdsA, positionIdsB;
-
-          Value posIdsSizeList = Torch::PrimListConstructOp::create(
-              rewriter, loc,
-              rewriter.getType<Torch::ListType>(
-                  rewriter.getType<Torch::IntType>()),
-              SmallVector<Value>{cstBatchSize, cstSequenceLength});
-          positionIdsA = Torch::AtenZerosOp::create(
-              rewriter, loc, positionIdsType, /*size=*/posIdsSizeList,
-              /*dtype=*/cstInt64Dtype,
-              /*layout=*/cstNone, /*device=*/cstNone,
-              /*pin_memory=*/cstNone);
-
           // Convert seqlens_k which is a tensor of type si32 to si64.
           Torch::ValueTensorType seqLensKType =
               cast<Torch::ValueTensorType>(seqlensK.getType());
           seqlensK = Torch::AtenToDtypeOp::create(
               rewriter, loc,
               seqLensKType.getWithSizesAndDtype(
-                  std::nullopt,
+                  seqLensKType.getSizes(),
                   rewriter.getIntegerType(/*width=*/64, /*isSigned=*/true)),
               seqlensK, cstInt64Dtype, /*non_blocking=*/cstFalse,
               /*copy=*/cstFalse, /*memory_format=*/cstNone);
@@ -674,16 +717,17 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               rewriter, binder.getLoc(),
               Torch::ListType::get(Torch::IntType::get(context)),
               llvm::SmallVector<Value>{cstBatchSize, cstIntOne});
-          positionIdsB = Torch::AtenRepeatOp::create(
+          Value positionIds = Torch::AtenRepeatOp::create(
               rewriter, loc, positionIdsType, initPosIds,
               /*repeats=*/repeatValuesList);
 
-          Value cstIntMinusOne = Torch::ConstantIntOp::create(
-              rewriter, binder.getLoc(), rewriter.getI64IntegerAttr(1));
           Value viewSizeList = Torch::PrimListConstructOp::create(
               rewriter, binder.getLoc(),
               Torch::ListType::get(Torch::IntType::get(context)),
-              llvm::SmallVector<Value>{cstIntMinusOne, cstIntOne});
+              llvm::SmallVector<Value>{
+                  Torch::ConstantIntOp::create(rewriter, binder.getLoc(),
+                                               rewriter.getI64IntegerAttr(-1)),
+                  cstIntOne});
 
           Torch::ValueTensorType seqLensViewType = Torch::ValueTensorType::get(
               context, llvm::SmallVector<int64_t>{batchSize, 1},
@@ -691,51 +735,9 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
           pastSeqLens = Torch::AtenViewOp::create(
               rewriter, loc, seqLensViewType, pastSeqLens, viewSizeList);
 
-          positionIdsB = Torch::AtenAddTensorOp::create(
-              rewriter, loc, positionIdsType, positionIdsB, pastSeqLens,
+          positionIds = Torch::AtenAddTensorOp::create(
+              rewriter, loc, positionIdsType, positionIds, pastSeqLens,
               /*alpha=*/cstIntOne);
-
-          totalSeqLens = Torch::AtenViewOp::create(
-              rewriter, loc, seqLensViewType, totalSeqLens, viewSizeList);
-          Value cond = Torch::AtenLtTensorOp::create(
-              rewriter, loc,
-              positionIdsType.getWithSizesAndDtype(positionIdsType.getSizes(),
-                                                   rewriter.getI1Type()),
-              positionIdsB, totalSeqLens);
-
-          Value cstOneTensorDataList = Torch::PrimListConstructOp::create(
-              rewriter, loc,
-              rewriter.getType<Torch::ListType>(
-                  rewriter.getType<Torch::IntType>()),
-              SmallVector<Value>{cstIntOne});
-          Value cstOneTensor = Torch::AtenTensorOp::create(
-              rewriter, loc,
-              Torch::ValueTensorType::get(
-                  context, {},
-                  IntegerType::get(context, 64, IntegerType::Signed)),
-              cstOneTensorDataList, /*dtype=*/cstInt64Dtype,
-              /*layout=*/cstNone, /*requires_grad=*/cstFalse);
-
-          positionIdsB = Torch::AtenWhereSelfOp::create(
-              rewriter, loc, positionIdsType, cond, positionIdsB, cstOneTensor);
-
-          isSubsequentPrompt = Torch::AtenIntBoolOp::create(
-              rewriter, loc, rewriter.getType<Torch::IntType>(),
-              isSubsequentPrompt);
-          isSubsequentPrompt = Torch::AtenFullOp::create(
-              rewriter, loc,
-              Torch::ValueTensorType::get(context, positionIdsSizeInt,
-                                          rewriter.getI1Type()),
-              /*size=*/posIdsSizeList, /*fill_value=*/isSubsequentPrompt,
-              /*dtype=*/
-              Torch::ConstantIntOp::create(
-                  rewriter, binder.getLoc(),
-                  rewriter.getI64IntegerAttr(
-                      (int)torch_upstream::ScalarType::Bool)),
-              /*layout=*/cstNone, /*device=*/cstNone, /*pin_memory=*/cstNone);
-          Value positionIds = Torch::AtenWhereSelfOp::create(
-              rewriter, loc, positionIdsType, isSubsequentPrompt, positionIdsB,
-              positionIdsA);
 
           // Performing RotaryEmbedding over Query and Key.
           qRotary = Torch::OnnxVariantRotaryEmbeddingOp::create(
@@ -745,7 +747,7 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               /*scale=*/cstFloatOne);
 
           kRotary = Torch::OnnxVariantRotaryEmbeddingOp::create(
-              rewriter, loc, qInput.getType(), kInput, positionIds, cosCache,
+              rewriter, loc, kInput.getType(), kInput, positionIds, cosCache,
               sinCache, cstInterleaved, /*is_packed_batching=*/cstIntZero,
               /*num_heads=*/cstIntZero, /*rotary_embedding_dim=*/cstIntZero,
               /*scale=*/cstFloatOne);
