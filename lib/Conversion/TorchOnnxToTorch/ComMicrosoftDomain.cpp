@@ -176,6 +176,19 @@ static LogicalResult splitPackedQKV(OpBinder &binder,
   return success();
 }
 
+static Value buildActiveCacheSlice(ConversionPatternRewriter &rewriter,
+                                   Location loc, Value cache, int64_t seqDimIdx,
+                                   Value seqDim, Value start, Value end,
+                                   Value step) {
+  auto cacheType = cast<Torch::ValueTensorType>(cache.getType());
+  SmallVector<int64_t> activeSizes(cacheType.getSizes());
+  activeSizes[seqDimIdx] = Torch::kUnknownSize;
+  Type activeType =
+      cacheType.getWithSizesAndDtype(activeSizes, cacheType.getOptionalDtype());
+  return Torch::AtenSliceTensorOp::create(rewriter, loc, activeType, cache,
+                                          seqDim, start, end, step);
+}
+
 } // namespace
 
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
@@ -790,15 +803,16 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
             rewriter, loc, pastValue.getType(), pastValue, vInput, cstCacheDim,
             pastSeqLen, totalSeqLen, cstIntOne);
 
-        // Slice active portion for attention: [0:total_seq_len]
-        // The sliced tensors have the same type as presentKey/presentValue
-        // (the slice operation returns a tensor with dynamic seq dim)
-        Value activeKey = Torch::AtenSliceTensorOp::create(
-            rewriter, loc, presentKey.getType(), presentKey, cstCacheDim,
-            cstIntZero, totalSeqLen, cstIntOne);
-        Value activeValue = Torch::AtenSliceTensorOp::create(
-            rewriter, loc, presentValue.getType(), presentValue, cstCacheDim,
-            cstIntZero, totalSeqLen, cstIntOne);
+        // Slice active portion [0:total_seq_len] for attention.
+        // KV cache layout is [batch, kv_num_heads, seq, head_size], so the
+        // sequence dimension is at index 2.
+        constexpr int64_t kCacheSeqDim = 2;
+        Value activeKey = buildActiveCacheSlice(
+            rewriter, loc, presentKey, kCacheSeqDim, cstCacheDim, cstIntZero,
+            totalSeqLen, cstIntOne);
+        Value activeValue = buildActiveCacheSlice(
+            rewriter, loc, presentValue, kCacheSeqDim, cstCacheDim, cstIntZero,
+            totalSeqLen, cstIntOne);
 
         // Do attention using the full active cache
         Value cstEnableGQA = Torch::ConstantBoolOp::create(rewriter, loc, true);
@@ -839,8 +853,6 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
                                                  attentionTransposed,
                                                  attentionResultSizesList);
 
-        // Return attention result and updated KV cache
-        // presentKey and presentValue were computed earlier via slice_scatter
         rewriter.replaceOp(binder.op, {attention, presentKey, presentValue});
         return success();
       });
@@ -1471,8 +1483,7 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         // Index 4 (`g_idx`) is deprecated in ORT.
         Value gIdx;
         if (succeeded(binder.tensorOperandAtIndex(gIdx, 4)))
-          return rewriter.notifyMatchFailure(
-              binder.op, "Deprecated: `g_idx`");
+          return rewriter.notifyMatchFailure(binder.op, "Deprecated: `g_idx`");
 
         if (failed(binder.tensorOperandAtIndex(bias, 5)))
           bias = Torch::ConstantNoneOp::create(rewriter, loc);

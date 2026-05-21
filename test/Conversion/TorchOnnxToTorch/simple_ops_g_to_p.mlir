@@ -2499,11 +2499,13 @@ func.func @test_group_query_attention(
   // KV cache in-place update using slice_scatter
   // CHECK:      %[[TOTAL_SEQ_INT:.*]] = torch.aten.item {{.*}} : {{.*}} -> !torch.int
   // CHECK:      %[[PAST_SEQ:.*]] = torch.aten.sub.int %[[TOTAL_SEQ_INT]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
-  // CHECK:      %[[PRESENT_K:.*]] = torch.aten.slice_scatter %[[PAST_K]], %[[K_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
-  // CHECK:      %[[PRESENT_V:.*]] = torch.aten.slice_scatter %[[PAST_V]], %[[V_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
-  // Slice active portion of KV cache
-  // CHECK:      %[[ACTIVE_K:.*]] = torch.aten.slice.Tensor %[[PRESENT_K]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
-  // CHECK:      %[[ACTIVE_V:.*]] = torch.aten.slice.Tensor %[[PRESENT_V]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
+  // CHECK-DAG:  %[[STEP:.*]] = torch.constant.int 1
+  // CHECK-DAG:  %[[CACHE_DIM:.*]] = torch.constant.int 2
+  // CHECK-DAG:  %[[START:.*]] = torch.constant.int 0
+  // CHECK:      %[[PRESENT_K:.*]] = torch.aten.slice_scatter %[[PAST_K]], %[[K_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
+  // CHECK:      %[[PRESENT_V:.*]] = torch.aten.slice_scatter %[[PAST_V]], %[[V_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
+  // CHECK:      %[[ACTIVE_K:.*]] = torch.aten.slice.Tensor %[[PRESENT_K]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_V:.*]] = torch.aten.slice.Tensor %[[PRESENT_V]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,?,8],f32>
   // Scaled dot product attention
   // CHECK:      %[[ATTN:.*]] = torch.aten.scaled_dot_product_attention %[[Q_PERMUTED]], %[[ACTIVE_K]], %[[ACTIVE_V]], {{.*}} -> !torch.vtensor<[1,2,1,8],f32>
   // Permute and reshape output back to [batch, seq, hidden]
@@ -2549,10 +2551,13 @@ func.func @test_group_query_attention_with_rotary_embedding(
   // KV cache in-place update
   // CHECK:      %[[TOTAL_SEQ_INT:.*]] = torch.aten.item {{.*}} : {{.*}} -> !torch.int
   // CHECK:      %[[PAST_SEQ:.*]] = torch.aten.sub.int %[[TOTAL_SEQ_INT]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
-  // CHECK:      %[[PRESENT_K:.*]] = torch.aten.slice_scatter %[[PAST_K]], %[[KEY_ROTARY]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
-  // CHECK:      %[[PRESENT_V:.*]] = torch.aten.slice_scatter %[[PAST_V]], %[[V_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
-  // CHECK:      %[[ACTIVE_K:.*]] = torch.aten.slice.Tensor %[[PRESENT_K]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
-  // CHECK:      %[[ACTIVE_V:.*]] = torch.aten.slice.Tensor %[[PRESENT_V]], {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
+  // CHECK-DAG:  %[[STEP:.*]] = torch.constant.int 1
+  // CHECK-DAG:  %[[CACHE_DIM:.*]] = torch.constant.int 2
+  // CHECK-DAG:  %[[START:.*]] = torch.constant.int 0
+  // CHECK:      %[[PRESENT_K:.*]] = torch.aten.slice_scatter %[[PAST_K]], %[[KEY_ROTARY]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
+  // CHECK:      %[[PRESENT_V:.*]] = torch.aten.slice_scatter %[[PAST_V]], %[[V_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,4,8],f32>
+  // CHECK:      %[[ACTIVE_K:.*]] = torch.aten.slice.Tensor %[[PRESENT_K]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_V:.*]] = torch.aten.slice.Tensor %[[PRESENT_V]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ_INT]], %[[STEP]] : {{.*}} -> !torch.vtensor<[1,2,?,8],f32>
   // Attention
   // CHECK:      %[[ATTN:.*]] = torch.aten.scaled_dot_product_attention %[[QUERY_ROTARY]], %[[ACTIVE_K]], %[[ACTIVE_V]], {{.*}} -> !torch.vtensor<[1,2,1,8],f32>
   // CHECK:      %[[ATTN_PERMUTED:.*]] = torch.aten.permute %[[ATTN]], {{.*}} -> !torch.vtensor<[1,1,2,8],f32>

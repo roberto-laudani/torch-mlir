@@ -47,14 +47,16 @@ func.func @test_group_query_attention(
   // Constants for attention
   // CHECK-DAG:  %[[NONE:.+]] = torch.constant.none
   // CHECK-DAG:  %[[TRUE:.+]] = torch.constant.bool true
-  // KV cache operations: compute past_seq_len, then slice_scatter to update cache
+  // KV cache in-place update via slice_scatter + slice the active
   // CHECK:      %[[TOTAL_SEQ:.+]] = torch.aten.item {{.*}} : {{.*}} -> !torch.int
   // CHECK:      %[[PAST_SEQ:.+]] = torch.aten.sub.int %[[TOTAL_SEQ]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
-  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[K_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // Slice to get active portion of KV cache
-  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], {{.*}}, {{.*}}, %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], {{.*}}, {{.*}}, %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK-DAG:  %[[STEP:.+]] = torch.constant.int 1
+  // CHECK-DAG:  %[[CACHE_DIM:.+]] = torch.constant.int 2
+  // CHECK-DAG:  %[[START:.+]] = torch.constant.int 0
+  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[K_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
   // Scaled dot product attention with is_causal=true
   // CHECK-DAG:  %[[TRUE_7:.+]] = torch.constant.bool true
   // CHECK-DAG:  %[[ZERO:.+]] = torch.constant.float 0.000000e+00
@@ -113,13 +115,16 @@ func.func @test_group_query_attention_scaled(
   // Constants
   // CHECK-DAG:  %[[NONE:.+]] = torch.constant.none
   // CHECK-DAG:  %[[TRUE:.+]] = torch.constant.bool true
-  // KV cache operations
+  // KV cache in-place update + active slice along cache seq dim (= 2).
   // CHECK:      %[[TOTAL_SEQ:.+]] = torch.aten.item {{.*}} : {{.*}} -> !torch.int
   // CHECK:      %[[PAST_SEQ:.+]] = torch.aten.sub.int %[[TOTAL_SEQ]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
-  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[K_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK-DAG:  %[[STEP:.+]] = torch.constant.int 1
+  // CHECK-DAG:  %[[CACHE_DIM:.+]] = torch.constant.int 2
+  // CHECK-DAG:  %[[START:.+]] = torch.constant.int 0
+  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[K_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
   // Attention with custom scale and is_causal=true
   // CHECK-DAG:  %[[TRUE_7:.+]] = torch.constant.bool true
   // CHECK-DAG:  %[[ZERO:.+]] = torch.constant.float 0.000000e+00
@@ -214,13 +219,17 @@ func.func @test_group_query_attention_rotary(
   // CHECK:      %[[QUERY_ROTARY:.+]] = torch.onnx.rotary_embedding %[[Q_PERMUTED]], %[[POS_IDS]], %[[COS_ARG]], %[[SIN_ARG]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
   // CHECK:      %[[KEY_ROTARY:.+]] = torch.onnx.rotary_embedding %[[K_PERMUTED]], %[[POS_IDS]], %[[COS_ARG]], %[[SIN_ARG]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
   //
-  // KV cache operations with rotary-embedded key
+  // KV cache in-place update with rotary-embedded key + active slice
+  // along cache seq dim (= 2).
   // CHECK:      %[[TOTAL_SEQ:.+]] = torch.aten.item {{.*}} : {{.*}} -> !torch.int
   // CHECK:      %[[PAST_SEQ:.+]] = torch.aten.sub.int %[[TOTAL_SEQ]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
-  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[KEY_ROTARY]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK-DAG:  %[[STEP:.+]] = torch.constant.int 1
+  // CHECK-DAG:  %[[CACHE_DIM:.+]] = torch.constant.int 2
+  // CHECK-DAG:  %[[START:.+]] = torch.constant.int 0
+  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[KEY_ROTARY]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
   // Attention with is_causal=true
   // CHECK-DAG:  %[[TRUE_GQA:.+]] = torch.constant.bool true
   // CHECK-DAG:  %[[ZERO:.+]] = torch.constant.float 0.000000e+00
@@ -288,13 +297,16 @@ func.func @test_group_query_attention_packed_qkv(
   // Constants for attention
   // CHECK-DAG:  %[[NONE:.+]] = torch.constant.none
   // CHECK-DAG:  %[[TRUE:.+]] = torch.constant.bool true
-  // KV cache operations
+  // KV cache in-place update + active slice along cache seq dim (= 2).
   // CHECK:      %[[TOTAL_SEQ:.+]] = torch.aten.item {{.*}} : {{.*}} -> !torch.int
   // CHECK:      %[[PAST_SEQ:.+]] = torch.aten.sub.int %[[TOTAL_SEQ]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
-  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[K_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], {{.*}}, %[[PAST_SEQ]], %[[TOTAL_SEQ]], {{.*}} : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
-  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK-DAG:  %[[STEP:.+]] = torch.constant.int 1
+  // CHECK-DAG:  %[[CACHE_DIM:.+]] = torch.constant.int 2
+  // CHECK-DAG:  %[[START:.+]] = torch.constant.int 0
+  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[K_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %[[V_PERMUTED]], %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], %[[CACHE_DIM]], %[[START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
   // Scaled dot product attention
   // CHECK-DAG:  %[[TRUE_7:.+]] = torch.constant.bool true
   // CHECK-DAG:  %[[ZERO:.+]] = torch.constant.float 0.000000e+00
