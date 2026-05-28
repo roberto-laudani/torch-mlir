@@ -16,6 +16,7 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Support/LLVM.h"
@@ -180,14 +181,22 @@ static Value getScalarIntValue(Value input, Location loc,
     return nullptr;
 
   if (auto valueTensorLiteralOp = input.getDefiningOp<ValueTensorLiteralOp>()) {
-    if (inputDtype.isInteger(64)) {
-      auto val = cast<DenseIntElementsAttr>(valueTensorLiteralOp.getValue())
-                     .getSplatValue<int64_t>();
-      return Torch::ConstantIntOp::create(rewriter, loc,
-                                          rewriter.getI64IntegerAttr(val));
-    } else {
-      auto val = cast<DenseIntElementsAttr>(valueTensorLiteralOp.getValue())
-                     .getSplatValue<bool>();
+    DenseElementsAttr attr;
+    auto valAttr = valueTensorLiteralOp.getValueAttr();
+    if (auto elemAttr = dyn_cast<DenseElementsAttr>(valAttr))
+      attr = elemAttr;
+    if (auto resourceAttr = dyn_cast<DenseResourceElementsAttr>(valAttr)) {
+      auto *blob = resourceAttr.getRawHandle().getBlob();
+      if (!blob)
+        return nullptr;
+      attr = DenseElementsAttr::getFromRawBuffer(
+          cast<ShapedType>(resourceAttr.getType()), blob->getData());
+    }
+    if (attr && attr.isSplat()) {
+      auto splatAttr = attr.getSplatValue<IntegerAttr>();
+      auto val = splatAttr.getType().isSignedInteger()
+                     ? splatAttr.getValue().getSExtValue()
+                     : splatAttr.getValue().getZExtValue();
       return Torch::ConstantIntOp::create(rewriter, loc,
                                           rewriter.getI64IntegerAttr(val));
     }
@@ -2655,7 +2664,8 @@ OpFoldResult AtenSelectIntOp::fold(FoldAdaptor adaptor) {
     return nullptr;
 
   if (self.isSplat())
-    return DenseElementsAttr::get(bty, self.getSplatValue<Attribute>());
+    return DenseElementsAttr::get(bty.clone(self.getElementType()),
+                                  self.getSplatValue<Attribute>());
 
   auto dimAttr = dyn_cast_or_null<IntegerAttr>(adaptor.getDim());
   auto indexAttr = dyn_cast_or_null<IntegerAttr>(adaptor.getIndex());
@@ -2671,7 +2681,7 @@ OpFoldResult AtenSelectIntOp::fold(FoldAdaptor adaptor) {
   }
 
   auto splattr = self.getValues<Attribute>()[index];
-  return DenseElementsAttr::get(bty, splattr);
+  return DenseElementsAttr::get(bty.clone(self.getElementType()), splattr);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3218,9 +3228,18 @@ LogicalResult ValueTensorLiteralOp::inferReturnTypes(
   if (!attr)
     return failure();
   RankedTensorType tensorType = cast<RankedTensorType>(attr.getType());
-  ValueTensorType returnType =
-      ValueTensorType::get(tensorType.getContext(), tensorType.getShape(),
-                           tensorType.getElementType());
+
+  // Convert signless integers (except i1) to signed for torch compatibility
+  Type elementType = tensorType.getElementType();
+  if (auto intType = dyn_cast<IntegerType>(elementType)) {
+    if (intType.isSignless() && intType.getWidth() > 1) {
+      elementType =
+          IntegerType::get(context, intType.getWidth(), IntegerType::Signed);
+    }
+  }
+
+  ValueTensorType returnType = ValueTensorType::get(
+      tensorType.getContext(), tensorType.getShape(), elementType);
   inferredReturnTypes.push_back(returnType);
   return success();
 }

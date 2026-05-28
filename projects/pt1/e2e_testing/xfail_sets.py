@@ -27,7 +27,6 @@ LINALG_XFAIL_SET = COMMON_TORCH_MLIR_LOWERING_XFAILS | {
     # unimplemented lowering torch -> linalg for torchvision.deform_conv2d
     # this is added to check the torch.onnx.export -> import_onnx -> torch path
     "DeformConv2D_basic",
-    "ReduceAnyDimFloatModule_basic",
     "UnfoldModule_basic",
     # _trilinear is an implementation of einsum, but sets dimensions to zero
     # if a dimension is specified in all expand lists, and not in sumdim list.
@@ -402,7 +401,6 @@ TORCHDYNAMO_CRASHING_SET = {
 
 FX_IMPORTER_XFAIL_SET = {
     "TimeOutModule_basic",  # this test is expected to time out
-    "ReduceAnyDimFloatModule_basic",
     "AddFloatIntModule_basic",
     "AllBoolFalseModule_basic",
     "AllBoolTrueModule_basic",
@@ -831,6 +829,7 @@ FX_IMPORTER_STABLEHLO_XFAIL_SET = {
     "QuantizedMLP_basic",
     "QuantizedNoLayer_basic",
     "QuantizedSingleLayer_basic",
+    "QuantizePerTensorModule_basic",
     "RandnDtypeDeviceModule_basic",
     "RandnGeneratorF64Module_basic",
     "RandnGeneratorModule_basic",
@@ -1757,8 +1756,6 @@ FX_IMPORTER_TOSA_CRASHING_SET = {
     "Aten_TrilinearModuleSumAllDims_basic",
     "Aten_TrilinearModuleSumdims_basic",
     "Aten_TrilinearModuleVaryingRanksUnorderedExpands_basic",
-    "CrossEntropyLossModule_basic",
-    "CrossEntropyLossNoReductionModule_basic",
     "ScatterSrcModule_basic",
     "ScatterSrcStaticModule_basic",
     "HBC_basic",
@@ -3199,6 +3196,7 @@ ONNX_XFAIL_SET = {
     "QuantizedReluInt8_basic",
     "QuantizedReluInt32_basic",
     "QuantizedReluUint8_basic",
+    "QuantizePerTensorModule_basic",
     "RandIntDtypeModule_basic",
     "RandIntModule_basic",
     "RandIntPinMemoryModule_basic",
@@ -3565,6 +3563,8 @@ ONNX_CRASHING_SET = LINALG_CRASHING_SET | {
 }
 
 FX_IMPORTER_TOSA_XFAIL_SET = {
+    "CrossEntropyLossModule_basic",
+    "CrossEntropyLossNoReductionModule_basic",
     "NumpyTRank0Module_basic",
     "Permute0RankModule_basic",
     "ArgsortTensor_basic",
@@ -4804,6 +4804,7 @@ ONNX_TOSA_XFAIL_SET = {
     "QuantizedReluInt8_basic",
     "QuantizedReluUint8_basic",
     "QuantizedSingleLayer_basic",
+    "QuantizePerTensorModule_basic",
     "RandIntDtypeModule_basic",
     "RandIntModule_basic",
     "RandIntPinMemoryModule_basic",

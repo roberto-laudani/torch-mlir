@@ -12,6 +12,7 @@
 
 #include "PopulatePatterns.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -3674,8 +3675,8 @@ public:
 
 private:
   struct RotaryParameters {
-    int64_t batchSize;
-    int64_t sequenceLength;
+    int64_t batchSize;      // May be kDynamic
+    int64_t sequenceLength; // May be kDynamic
     int64_t hiddenSize;
     int64_t headSize;
     int64_t rotaryEmbeddingDim;
@@ -3697,10 +3698,11 @@ private:
     //    sin_cache    : (max_sequence_length, head_size / 2) or
     //                   (max_sequence_length, rotary_embedding_dim / 2)
 
-    // For the `RotaryEmbedding` lowering to work, shapes of all the inputs are
-    // required to be statically known.
+    // Check input - support both rank 3 and rank 4
+    // Rank 3: (batch_size, sequence_length, hidden_size)
+    // Rank 4: (batch_size, num_heads, sequence_length, head_size)
+    // Dynamic batch/seq dimensions are allowed.
 
-    // Check input
     RankedTensorType inputType = cast<RankedTensorType>(input.getType());
 
     SmallVector<int64_t> inputShape{inputType.getShape()};
@@ -3708,7 +3710,20 @@ private:
       return rewriter.notifyMatchFailure(
           op, "input is expected to have rank 3 or 4");
 
-    // Check position_ids
+    if (inputRank != 3 && inputRank != 4)
+      return rewriter.notifyMatchFailure(
+          op, "input is expected to have rank 3 or 4");
+
+    // For rank 3: hidden_size (dim 2) must be static for reshape computation
+    // For rank 4: head_size (dim 3) must be static
+    if (inputRank == 3 && inputShape[2] == ShapedType::kDynamic)
+      return rewriter.notifyMatchFailure(
+          op, "hidden_size (dim 2) must be static for rank 3 input");
+    if (inputRank == 4 && inputShape[3] == ShapedType::kDynamic)
+      return rewriter.notifyMatchFailure(
+          op, "head_size (dim 3) must be static for rank 4 input");
+
+    // Check position_ids - allow dynamic dims, just check rank
     RankedTensorType positionIdsType =
         cast<RankedTensorType>(positionIds.getType());
 
@@ -3813,10 +3828,11 @@ private:
     parameters.sequenceLength = sequenceLength;
     parameters.hiddenSize = hiddenSize;
     parameters.headSize = headSize;
-    parameters.numHeads = numHeads;
+    parameters.numHeads = computedNumHeads;
     parameters.maxSequenceLength = maxSequenceLength;
     parameters.rotaryEmbeddingDim =
         rotaryEmbeddingDim > 0 ? rotaryEmbeddingDim : headSize;
+    parameters.inputRank = inputRank;
 
     return success();
   }
@@ -3913,8 +3929,19 @@ private:
       auto currentDimSize = tensor::DimOp::create(rewriter, loc, preprocessedInput, i);
       resultShape.push_back(currentDimSize);
     }
+
+    // Build result shape for the rank-4 linalg.generic output
+    // processedInput is always rank 4 at this point
+    SmallVector<OpFoldResult> resultDimsOFR =
+        tensor::getMixedSizes(rewriter, loc, processedInput);
+
+    // Create output tensor with mixed static/dynamic dims
     Value outTensor =
-        createZeroInitTensor(rewriter, loc, resultShape, elementType);
+        tensor::EmptyOp::create(rewriter, loc, resultDimsOFR, elementType);
+    Value zero = arith::ConstantOp::create(rewriter, loc,
+                                           rewriter.getZeroAttr(elementType));
+    outTensor =
+        linalg::FillOp::create(rewriter, loc, zero, outTensor).getResult(0);
 
     Value cstFloatOne = arith::ConstantOp::create(
         rewriter, loc, rewriter.getFloatAttr(elementType, 1.0));
@@ -3929,14 +3956,17 @@ private:
     Value cstHalfRotaryEmbDim = arith::ConstantOp::create(
         rewriter, loc, rewriter.getIndexAttr(halfRotaryEmbDim));
 
+    // Always rank 4 after reshape
+    unsigned processedRank = 4;
     AffineMap identityMap =
-        AffineMap::getMultiDimIdentityMap(inputRank, context);
-    AffineMap positionIdsMap = identityMap.getSubMap({0, inputRank - 2});
+        AffineMap::getMultiDimIdentityMap(processedRank, context);
+    // position_ids maps to (batch, seq) which is dims (0, 2) for rank 4
+    AffineMap positionIdsMap = identityMap.getSubMap({0, 2});
 
     SmallVector<AffineMap> indexingMaps{identityMap, positionIdsMap,
                                         /*outputMap=*/identityMap};
     SmallVector<utils::IteratorType> iteratorTypes(
-        inputRank, utils::IteratorType::parallel);
+        processedRank, utils::IteratorType::parallel);
 
     auto rotaryEmbedding =
         linalg::GenericOp::create(

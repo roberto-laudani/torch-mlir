@@ -2679,6 +2679,24 @@ func.func @torch.aten.ScalarImplicit$canonicalize_literal_0d() -> !torch.number 
     return %1 : !torch.number
 }
 
+// CHECK-LABEL:   func.func @torch.aten.ScalarImplicit$dense_resource() -> !torch.number {
+// CHECK:             %int42 = torch.constant.int 42
+// CHECK:             %[[VAL_0:.*]] = torch.derefine %int42 : !torch.int to !torch.number
+// CHECK:             return %[[VAL_0]] : !torch.number
+func.func @torch.aten.ScalarImplicit$dense_resource() -> !torch.number {
+    %0 = torch.vtensor.literal(dense_resource<blob_si64> : tensor<si64>) : !torch.vtensor<[],si64>
+    %1 = torch.aten.ScalarImplicit %0 : !torch.vtensor<[],si64> -> !torch.number
+    return %1 : !torch.number
+}
+
+{-#
+  dialect_resources: {
+    builtin: {
+      blob_si64: "0x080000002a00000000000000"
+    }
+  }
+#-}
+
 // -----
 
 // CHECK-LABEL:   func.func @torch.aten.ScalarImplicit$canonicalize_literal_0d_float() -> !torch.number {
@@ -3086,6 +3104,16 @@ func.func @aten_select_int_fold_splat(%arg0 : !torch.int, %arg1 : !torch.int) ->
   return %select : !torch.vtensor<[1],si64>
 }
 
+// -----
+
+// CHECK-LABEL: @aten_select_signless_int_fold_splat
+func.func @aten_select_signless_int_fold_splat(%arg0 : !torch.int, %arg1 : !torch.int) -> !torch.vtensor<[1],si64> {
+  %splat = torch.vtensor.literal(dense<4> : tensor<4xi64>) : !torch.vtensor<[4],si64>
+  %select = torch.aten.select.int %splat, %arg0, %arg1 : !torch.vtensor<[4],si64>, !torch.int, !torch.int -> !torch.vtensor<[1],si64>
+  // CHECK: %[[RET:.+]] = torch.vtensor.literal(dense<4> : tensor<1xi64>) : !torch.vtensor<[1],si64>
+  // CHECK: return %[[RET]]
+  return %select : !torch.vtensor<[1],si64>
+}
 // -----
 
 // CHECK-LABEL: @aten_select_int_fold_1D
