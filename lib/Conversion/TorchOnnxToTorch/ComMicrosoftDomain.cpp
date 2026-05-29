@@ -914,6 +914,12 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
             rewriter.getI64IntegerAttr((int)torch_upstream::ScalarType::Long));
 
         Type intListType = Torch::ListType::get(Torch::IntType::get(context));
+        Value cstFloatZero = Torch::ConstantFloatOp::create(
+            rewriter, loc, rewriter.getType<Torch::FloatType>(),
+            rewriter.getF64FloatAttr(0.0));
+        auto intSiType = rewriter.getIntegerType(64, /*isSigned=*/true);
+        Value cstDim3 = Torch::ConstantIntOp::create(
+            rewriter, loc, rewriter.getI64IntegerAttr(3));
 
         // Convert seqlens_k to int64 unconditionally (may be si32 from ONNX).
         Torch::ValueTensorType seqLensKType =
