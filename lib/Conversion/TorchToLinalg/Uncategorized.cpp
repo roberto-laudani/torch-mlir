@@ -3828,11 +3828,10 @@ private:
     parameters.sequenceLength = sequenceLength;
     parameters.hiddenSize = hiddenSize;
     parameters.headSize = headSize;
-    parameters.numHeads = computedNumHeads;
+    parameters.numHeads = numHeads;
     parameters.maxSequenceLength = maxSequenceLength;
     parameters.rotaryEmbeddingDim =
         rotaryEmbeddingDim > 0 ? rotaryEmbeddingDim : headSize;
-    parameters.inputRank = inputRank;
 
     return success();
   }
@@ -3931,9 +3930,9 @@ private:
     }
 
     // Build result shape for the rank-4 linalg.generic output
-    // processedInput is always rank 4 at this point
+    // preprocessedInput is always rank 4 at this point
     SmallVector<OpFoldResult> resultDimsOFR =
-        tensor::getMixedSizes(rewriter, loc, processedInput);
+        tensor::getMixedSizes(rewriter, loc, preprocessedInput);
 
     // Create output tensor with mixed static/dynamic dims
     Value outTensor =
