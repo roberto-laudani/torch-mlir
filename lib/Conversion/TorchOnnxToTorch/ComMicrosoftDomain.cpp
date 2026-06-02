@@ -18,16 +18,17 @@ using namespace mlir::torch;
 using namespace mlir::torch::onnx_c;
 
 namespace {
-/// Result struct for decomposed RMS normalization
+
+/// Result struct for decomposed RMS normalization.
 struct RMSNormResult {
   Value output;    // normalized * scale
-  Value meanSq;    // mean(x²) - intermediate
-  Value invStdVar; // rsqrt(mean(x²) + eps) - intermediate
+  Value meanSq;    // mean(x^2) - intermediate
+  Value invStdVar; // rsqrt(mean(x^2) + eps) - intermediate
 };
 
-/// Build decomposed RMS normalization ops.
-/// Returns the output and intermediates (meanSq, invStdVar) for optional
-/// outputs. RMS norm formula: y = x * rsqrt(mean(x²) + eps) * scale
+/// Build decomposed RMS normalization ops over dims [axis, rank).
+/// RMS norm: y = x * rsqrt(mean(x^2) + eps) * scale. Returns the output and the
+/// intermediates (meanSq, invStdVar) for the optional ONNX outputs.
 static RMSNormResult buildRMSNorm(OpBinder &binder,
                                   ConversionPatternRewriter &rewriter,
                                   Value input, Value scale, Value epsilon,
@@ -37,41 +38,38 @@ static RMSNormResult buildRMSNorm(OpBinder &binder,
   ArrayRef<int64_t> inputShape = inputTy.getSizes();
   int64_t rank = inputShape.size();
 
-  // Build reduce dims list [axis, axis+1, ..., rank-1]
   auto context = binder.op->getContext();
   auto sizeListType = Torch::ListType::get(Torch::IntType::get(context));
   SmallVector<Value> reduceDimVals;
-  for (int64_t i = axis; i < rank; i++) {
+  for (int64_t i = axis; i < rank; i++)
     reduceDimVals.push_back(Torch::ConstantIntOp::create(
         rewriter, loc, rewriter.getI64IntegerAttr(i)));
-  }
   Value reduceDimList = Torch::PrimListConstructOp::create(
       rewriter, loc, sizeListType, reduceDimVals);
 
-  // Compute reduced shape for meanSq/invStdVar (keepdim=true)
   SmallVector<int64_t> reducedShape(inputShape.begin(), inputShape.end());
   for (int64_t i = axis; i < rank; i++)
     reducedShape[i] = 1;
   auto reducedType =
       Torch::ValueTensorType::get(context, reducedShape, inputTy.getDtype());
 
-  // x²
+  // x^2
   Value xSquared =
       Torch::AtenMulTensorOp::create(rewriter, loc, inputTy, input, input);
 
-  // mean(x²) with keepdim=true
+  // mean(x^2) with keepdim=true
   Value cstTrue = Torch::ConstantBoolOp::create(rewriter, loc, true);
   Value none = Torch::ConstantNoneOp::create(rewriter, loc);
   Value meanSq = Torch::AtenMeanDimOp::create(
       rewriter, loc, reducedType, xSquared, reduceDimList, cstTrue, none);
 
-  // mean(x²) + eps
+  // mean(x^2) + eps
   Value one = Torch::ConstantIntOp::create(rewriter, loc,
                                            rewriter.getI64IntegerAttr(1));
   Value meanPlusEps = Torch::AtenAddScalarOp::create(rewriter, loc, reducedType,
                                                      meanSq, epsilon, one);
 
-  // inv_std_var = rsqrt(mean(x²) + eps)
+  // inv_std_var = rsqrt(mean(x^2) + eps)
   Value invStdVar =
       Torch::AtenRsqrtOp::create(rewriter, loc, reducedType, meanPlusEps);
 
@@ -85,6 +83,7 @@ static RMSNormResult buildRMSNorm(OpBinder &binder,
 
   return {output, meanSq, invStdVar};
 }
+
 
 /// If input is 1D, reshape it to (n, size/n). None or already-2D inputs pass
 /// through unchanged. ONNX MatMulNBits allows scales and zero_points to be
@@ -193,113 +192,6 @@ static Value buildActiveCacheSlice(ConversionPatternRewriter &rewriter,
 
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
     OnnxCustomOpConversionPattern &patterns) {
-  patterns.onOp(
-      "SimplifiedLayerNormalization", 1,
-      [](OpBinder binder, ConversionPatternRewriter &rewriter) {
-        Torch::ValueTensorType yType;
-        Value x, scale;
-        int64_t axis;
-        float epsilon;
-        if (binder.tensorOperandAtIndex(x, 0) ||
-            binder.tensorOperandAtIndex(scale, 1) ||
-            binder.tensorResultTypeAtIndex(yType, 0) ||
-            binder.s64IntegerAttr(axis, "axis", -1) ||
-            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f))
-          return failure();
-
-        auto xType = dyn_cast<Torch::ValueTensorType>(x.getType());
-        if (!xType || !xType.hasSizes())
-          return rewriter.notifyMatchFailure(binder.op,
-                                             "Expected input to have sizes");
-
-        ArrayRef<int64_t> xShape = xType.getSizes();
-        int64_t rank = static_cast<int64_t>(xShape.size());
-        int64_t axisNorm = Torch::toPositiveDim(axis, rank);
-
-        // Build epsilon constant
-        Value constEpsilon = Torch::ConstantFloatOp::create(
-            rewriter, binder.getLoc(), rewriter.getType<Torch::FloatType>(),
-            rewriter.getF64FloatAttr(epsilon));
-
-        // Use decomposed RMS norm to get intermediates
-        RMSNormResult rmsResult = buildRMSNorm(binder, rewriter, x, scale,
-                                               constEpsilon, axisNorm, yType);
-
-        // Build results
-        SmallVector<Value> results;
-        results.push_back(rmsResult.output);
-
-        // Output 1: inv_std_var (only if requested)
-        if (binder.op->getNumResults() > 1)
-          results.push_back(rmsResult.invStdVar);
-
-        rewriter.replaceOp(binder.op, results);
-        return success();
-      });
-  patterns.onOp(
-      "SkipSimplifiedLayerNormalization", 1,
-      [](OpBinder binder, ConversionPatternRewriter &rewriter) {
-        Torch::ValueTensorType yType;
-        Value x, skip, scale;
-        float epsilon;
-        if (binder.tensorOperandAtIndex(x, 0) ||
-            binder.tensorOperandAtIndex(skip, 1) ||
-            binder.tensorOperandAtIndex(scale, 2) ||
-            binder.tensorResultTypeAtIndex(yType, 0) ||
-            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f))
-          return failure();
-
-        // Optional bias at operand 3.
-        Value bias;
-        if (failed(binder.tensorOperandAtIndex(bias, 3)))
-          bias = Torch::ConstantNoneOp::create(rewriter, binder.getLoc());
-
-        // First compute x + skip (+ bias if present) - this is what gets
-        // normalized
-        Value alpha = Torch::ConstantFloatOp::create(
-            rewriter, binder.getLoc(), rewriter.getF64FloatAttr(1.0));
-        Value inputSkipBiasSum = Torch::AtenAddTensorOp::create(
-            rewriter, binder.getLoc(), yType, x, skip, alpha);
-        if (!isa<Torch::NoneType>(bias.getType()))
-          inputSkipBiasSum = Torch::AtenAddTensorOp::create(
-              rewriter, binder.getLoc(), yType, inputSkipBiasSum, bias, alpha);
-
-        auto inputType =
-            dyn_cast<Torch::ValueTensorType>(inputSkipBiasSum.getType());
-        if (!inputType || !inputType.hasSizes())
-          return rewriter.notifyMatchFailure(binder.op,
-                                             "Expected input to have sizes");
-
-        ArrayRef<int64_t> inputShape = inputType.getSizes();
-        int64_t rank = static_cast<int64_t>(inputShape.size());
-
-        // Build epsilon constant
-        Value constEpsilon = Torch::ConstantFloatOp::create(
-            rewriter, binder.getLoc(), rewriter.getType<Torch::FloatType>(),
-            rewriter.getF64FloatAttr(epsilon));
-
-        // Use decomposed RMS norm to get intermediates
-        // Normalize over the last dimension (axis = rank - 1)
-        int64_t axis = rank - 1;
-        RMSNormResult rmsResult =
-            buildRMSNorm(binder, rewriter, inputSkipBiasSum, scale,
-                         constEpsilon, axis, yType);
-
-        // Build results based on number of declared outputs
-        SmallVector<Value> results;
-        int64_t numResults = binder.op->getNumResults();
-
-        results.push_back(rmsResult.output); // output 0: normalized
-        if (numResults > 1)
-          results.push_back(rmsResult.meanSq); // output 1: mean(x²)
-        if (numResults > 2)
-          results.push_back(rmsResult.invStdVar); // output 2: inv_std_var
-        if (numResults > 3)
-          results.push_back(inputSkipBiasSum); // output 3: input_skip_bias_sum
-
-        rewriter.replaceOp(binder.op, results);
-        return success();
-      });
   patterns.onOp(
       "MatMulIntegerToFloat", 1,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
@@ -469,25 +361,32 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
       "SimplifiedLayerNormalization", 1,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Location loc = binder.getLoc();
-
-        Value input, scale;
-        float epsilon;
+        Value x, scale;
         int64_t axis, stashType;
+        float epsilon;
         SmallVector<Type> resultTypes;
-        if (binder.tensorOperandAtIndex(input, 0) ||
+        if (binder.tensorOperandAtIndex(x, 0) ||
             binder.tensorOperandAtIndex(scale, 1) ||
-            binder.f32FloatAttr(epsilon, "epsilon", 1e-5f) ||
             binder.s64IntegerAttr(axis, "axis", -1) ||
+            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f) ||
             binder.s64IntegerAttr(stashType, "stash_type", 1) ||
             binder.tensorResultTypes(resultTypes))
           return rewriter.notifyMatchFailure(binder.op,
                                              "Failed to bind inputs/attrs");
 
-        if (resultTypes.size() != 1)
+        // ONNX outputs: Y, inv_std_var (optional).
+        if (resultTypes.size() < 1 || resultTypes.size() > 2)
           return rewriter.notifyMatchFailure(binder.op,
                                              "unsupported number of results");
 
-        // Convert stash_type to torch dtype
+        auto xType = dyn_cast<Torch::ValueTensorType>(x.getType());
+        if (!xType || !xType.hasSizes() || !xType.hasDtype())
+          return rewriter.notifyMatchFailure(
+              binder.op, "Expected input to have sizes and dtype");
+        int64_t rank = static_cast<int64_t>(xType.getSizes().size());
+        int64_t axisNorm = Torch::toPositiveDim(axis, rank);
+
+        // stash_type: upcast inputs to this dtype for numerical stability.
         std::optional<int64_t> stashTypeIntTorch =
             onnxDtypeIntToTorchDtypeInt(stashType);
         if (!stashTypeIntTorch.has_value())
@@ -498,84 +397,75 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
             (torch_upstream::ScalarType)stashTypeIntTorch.value());
         if (failed(stashDtype))
           return failure();
-
-        // Get input type to determine shapes and dtype
-        Torch::ValueTensorType inputType =
-            cast<Torch::ValueTensorType>(input.getType());
-        if (!inputType.hasDtype() || !inputType.hasSizes())
-          return rewriter.notifyMatchFailure(
-              binder.op, "input should have dtype and sizes");
-
-        // Get tensor rank to normalize axis
-        std::optional<unsigned> maybeRank = Torch::getTensorRank(input);
-        if (!maybeRank || *maybeRank == 0)
-          return rewriter.notifyMatchFailure(binder.op,
-                                             "unranked or scalar input tensor");
-        unsigned inputRank = *maybeRank;
-
-        // Upcast input to stash_type for numerical stability
-        Type origDtype = inputType.getOptionalDtype();
-        if (*stashDtype != origDtype)
-          input =
-              Torch::convertTensorToDtype(rewriter, loc, input, *stashDtype);
-
-        // Build normalized_shape: [inputShape[axis], ..., inputShape[-1]]
-        axis = Torch::toPositiveDim(axis, inputRank);
-        auto castInput = cast<Torch::ValueTensorType>(input.getType());
-        ArrayRef<int64_t> inputShape = castInput.getSizes();
-        SmallVector<Value> normalizedShapeValues;
-        for (int64_t n = axis; n < static_cast<int64_t>(inputRank); n++) {
-          normalizedShapeValues.push_back(Torch::ConstantIntOp::create(
-              rewriter, loc, rewriter.getI64IntegerAttr(inputShape[n])));
+        Type origDtype = xType.getOptionalDtype();
+        bool upcast = (*stashDtype != origDtype);
+        if (upcast) {
+          x = Torch::convertTensorToDtype(rewriter, loc, x, *stashDtype);
+          scale = Torch::convertTensorToDtype(rewriter, loc, scale, *stashDtype);
         }
-        Value normalizedShape = Torch::PrimListConstructOp::create(
-            rewriter, loc,
-            Torch::ListType::get(Torch::IntType::get(binder.op->getContext())),
-            normalizedShapeValues);
+        Type stashOutType = x.getType();
 
-        Value cstEpsilon = Torch::ConstantFloatOp::create(
-            rewriter, loc, rewriter.getF64FloatAttr(epsilon));
+        Value constEpsilon = Torch::ConstantFloatOp::create(
+            rewriter, loc, rewriter.getType<Torch::FloatType>(),
+            rewriter.getF64FloatAttr(epsilon));
 
-        // Emit aten.rms_norm (in stash dtype if upcasted)
-        Value output =
-            Torch::AtenRmsNormOp::create(rewriter, loc, input.getType(), input,
-                                         normalizedShape, scale, cstEpsilon);
+        // Decomposed RMS norm (computed in stash dtype) exposes intermediates.
+        RMSNormResult rms = buildRMSNorm(binder, rewriter, x, scale,
+                                         constEpsilon, axisNorm, stashOutType);
 
-        // Cast output back to original dtype if upcasted
-        if (*stashDtype != origDtype)
-          output =
-              Torch::convertTensorToDtype(rewriter, loc, output, origDtype);
+        Value output = rms.output;
+        if (upcast)
+          output = Torch::convertTensorToDtype(rewriter, loc, output, origDtype);
 
-        rewriter.replaceOp(binder.op, {output});
+        SmallVector<Value> results;
+        results.push_back(output);
+        if (resultTypes.size() == 2) {
+          // Optional output 1: inv_std_var (reduced shape).
+          Value invStd = rms.invStdVar;
+          Type want = cast<Torch::ValueTensorType>(resultTypes[1]).getDtype();
+          if (want != cast<Torch::ValueTensorType>(invStd.getType()).getDtype())
+            invStd = Torch::convertTensorToDtype(rewriter, loc, invStd, want);
+          results.push_back(invStd);
+        }
+        rewriter.replaceOp(binder.op, results);
         return success();
       });
   patterns.onOp(
       "SkipSimplifiedLayerNormalization", 1,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Location loc = binder.getLoc();
-
-        Value input, skip, gamma;
+        Value x, skip, scale;
         float epsilon;
         int64_t stashType;
         SmallVector<Type> resultTypes;
-        if (binder.tensorOperandAtIndex(input, 0) ||
+        if (binder.tensorOperandAtIndex(x, 0) ||
             binder.tensorOperandAtIndex(skip, 1) ||
-            binder.tensorOperandAtIndex(gamma, 2) ||
-            binder.f32FloatAttr(epsilon, "epsilon", 1e-5f) ||
+            binder.tensorOperandAtIndex(scale, 2) ||
+            binder.f32FloatAttr(epsilon, "epsilon", 0.00001f) ||
             binder.s64IntegerAttr(stashType, "stash_type", 1) ||
             binder.tensorResultTypes(resultTypes))
           return rewriter.notifyMatchFailure(binder.op,
                                              "Failed to bind inputs/attrs");
 
-        if (resultTypes.size() > 2)
+        // ONNX outputs (in order): output, mean, inv_std_var,
+        // input_skip_bias_sum (all optional except output). We match each
+        // declared result to the produced value by shape: a full-shape result
+        // takes input_skip_bias_sum, a reduced-shape result takes mean then
+        // inv_std_var (ONNX spec order).
+        if (resultTypes.size() < 1 || resultTypes.size() > 4)
           return rewriter.notifyMatchFailure(binder.op,
                                              "unsupported number of results");
 
-        // Optional bias (index 3)
-        Value bias;
-        bool hasBias = !binder.tensorOperandAtIndex(bias, 3);
+        auto xType = dyn_cast<Torch::ValueTensorType>(x.getType());
+        if (!xType || !xType.hasSizes() || !xType.hasDtype())
+          return rewriter.notifyMatchFailure(
+              binder.op, "Expected input to have sizes and dtype");
 
-        // Convert stash_type to torch dtype
+        // Optional bias at operand 3.
+        Value bias;
+        bool hasBias = !failed(binder.tensorOperandAtIndex(bias, 3));
+
+        // stash_type: upcast inputs for numerical stability.
         std::optional<int64_t> stashTypeIntTorch =
             onnxDtypeIntToTorchDtypeInt(stashType);
         if (!stashTypeIntTorch.has_value())
@@ -586,77 +476,70 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
             (torch_upstream::ScalarType)stashTypeIntTorch.value());
         if (failed(stashDtype))
           return failure();
-
-        // Get input type to determine shapes and dtype
-        Torch::ValueTensorType inputType =
-            cast<Torch::ValueTensorType>(input.getType());
-        if (!inputType.hasDtype() || !inputType.hasSizes())
-          return rewriter.notifyMatchFailure(
-              binder.op, "input should have dtype and sizes");
-
-        // Get tensor rank to compute last dimension
-        std::optional<unsigned> maybeRank = Torch::getTensorRank(input);
-        if (!maybeRank || *maybeRank == 0)
-          return rewriter.notifyMatchFailure(binder.op,
-                                             "unranked or scalar input tensor");
-        unsigned inputRank = *maybeRank;
-
-        Value cstOne = Torch::ConstantFloatOp::create(
-            rewriter, loc, rewriter.getF64FloatAttr(1.0));
-        Value cstEpsilon = Torch::ConstantFloatOp::create(
-            rewriter, loc, rewriter.getF64FloatAttr(epsilon));
-
-        // Upcast inputs to stash_type for numerical stability
-        Type origDtype = inputType.getOptionalDtype();
-        if (*stashDtype != origDtype) {
-          input =
-              Torch::convertTensorToDtype(rewriter, loc, input, *stashDtype);
+        Type origDtype = xType.getOptionalDtype();
+        bool upcast = (*stashDtype != origDtype);
+        if (upcast) {
+          x = Torch::convertTensorToDtype(rewriter, loc, x, *stashDtype);
           skip = Torch::convertTensorToDtype(rewriter, loc, skip, *stashDtype);
+          scale = Torch::convertTensorToDtype(rewriter, loc, scale, *stashDtype);
           if (hasBias)
-            bias =
-                Torch::convertTensorToDtype(rewriter, loc, bias, *stashDtype);
+            bias = Torch::convertTensorToDtype(rewriter, loc, bias, *stashDtype);
+        }
+        auto stashXType = cast<Torch::ValueTensorType>(x.getType());
+
+        // s = x + skip (+ bias) - this is what gets normalized.
+        Value alpha = Torch::ConstantFloatOp::create(
+            rewriter, loc, rewriter.getF64FloatAttr(1.0));
+        Value inputSkipBiasSum = Torch::AtenAddTensorOp::create(
+            rewriter, loc, stashXType, x, skip, alpha);
+        if (hasBias)
+          inputSkipBiasSum = Torch::AtenAddTensorOp::create(
+              rewriter, loc, stashXType, inputSkipBiasSum, bias, alpha);
+
+        int64_t rank = static_cast<int64_t>(stashXType.getSizes().size());
+        Value constEpsilon = Torch::ConstantFloatOp::create(
+            rewriter, loc, rewriter.getType<Torch::FloatType>(),
+            rewriter.getF64FloatAttr(epsilon));
+
+        // Normalize over the last dimension.
+        RMSNormResult rms =
+            buildRMSNorm(binder, rewriter, inputSkipBiasSum, scale, constEpsilon,
+                         rank - 1, stashXType);
+
+        Value output = rms.output;
+        Value sum = inputSkipBiasSum;
+        if (upcast) {
+          output = Torch::convertTensorToDtype(rewriter, loc, output, origDtype);
+          sum = Torch::convertTensorToDtype(rewriter, loc, sum, origDtype);
         }
 
-        // Step 1: Compute s = input + skip + bias (if present)
-        Value s = Torch::AtenAddTensorOp::create(rewriter, loc, input.getType(),
-                                                 input, skip, cstOne);
-
-        if (hasBias) {
-          s = Torch::AtenAddTensorOp::create(rewriter, loc, input.getType(), s,
-                                             bias, cstOne);
+        // Assign declared results by shape.
+        ArrayRef<int64_t> fullShape =
+            cast<Torch::ValueTensorType>(resultTypes[0]).getSizes();
+        SmallVector<Value> reducedQueue = {rms.meanSq, rms.invStdVar};
+        size_t reducedIdx = 0;
+        SmallVector<Value> results;
+        results.push_back(output);
+        for (size_t i = 1; i < resultTypes.size(); i++) {
+          auto rt = cast<Torch::ValueTensorType>(resultTypes[i]);
+          Value v;
+          if (rt.getSizes() == fullShape) {
+            v = sum; // input_skip_bias_sum
+          } else if (reducedIdx < reducedQueue.size()) {
+            v = reducedQueue[reducedIdx++]; // mean, then inv_std_var
+          } else {
+            return rewriter.notifyMatchFailure(binder.op,
+                                               "unsupported result layout");
+          }
+          Type want = rt.getDtype();
+          if (want != cast<Torch::ValueTensorType>(v.getType()).getDtype())
+            v = Torch::convertTensorToDtype(rewriter, loc, v, want);
+          results.push_back(v);
         }
-
-        // Build normalized_shape for last dimension: [inputShape[-1]]
-        auto castInput = cast<Torch::ValueTensorType>(input.getType());
-        ArrayRef<int64_t> inputShape = castInput.getSizes();
-        Value cstLastDimSize = Torch::ConstantIntOp::create(
-            rewriter, loc,
-            rewriter.getI64IntegerAttr(inputShape[inputRank - 1]));
-        Value normalizedShape = Torch::PrimListConstructOp::create(
-            rewriter, loc,
-            Torch::ListType::get(Torch::IntType::get(binder.op->getContext())),
-            SmallVector<Value>{cstLastDimSize});
-
-        // Emit aten.rms_norm (in stash dtype if upcasted)
-        Value output =
-            Torch::AtenRmsNormOp::create(rewriter, loc, input.getType(), s,
-                                         normalizedShape, gamma, cstEpsilon);
-
-        // Cast results back to original dtype if upcasted
-        if (*stashDtype != origDtype) {
-          output =
-              Torch::convertTensorToDtype(rewriter, loc, output, origDtype);
-          s = Torch::convertTensorToDtype(rewriter, loc, s, origDtype);
-        }
-
-        if (resultTypes.size() == 1) {
-          rewriter.replaceOp(binder.op, {output});
-        } else {
-          // 2-output: (output, input_skip_bias_sum)
-          rewriter.replaceOp(binder.op, {output, s});
-        }
+        rewriter.replaceOp(binder.op, results);
         return success();
       });
+
   patterns.onOp(
       "GroupQueryAttention", 1,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {

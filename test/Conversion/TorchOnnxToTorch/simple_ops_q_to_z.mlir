@@ -811,10 +811,17 @@ func.func @test_simplified_layer_normalization(%arg0: !torch.vtensor<[2,8,256],f
 // CHECK-LABEL: func.func @test_simplified_layer_normalization
 // CHECK-SAME:    %[[INPUT:[a-zA-Z0-9]+]]: !torch.vtensor<[2,8,256],f32>
 // CHECK-SAME:    %[[SCALE:[a-zA-Z0-9]+]]: !torch.vtensor<[256],f32>
-// CHECK:         %[[DIM:.+]] = torch.constant.int 256
-// CHECK:         %[[SHAPE:.+]] = torch.prim.ListConstruct %[[DIM]]
+// Decomposed RMS norm: y = x * rsqrt(mean(x^2) + eps) * scale
 // CHECK:         %[[EPS:.+]] = torch.constant.float 9.9999997473787516E-6
-// CHECK:         torch.aten.rms_norm %[[INPUT]], %[[SHAPE]], %[[SCALE]], %[[EPS]]
+// CHECK:         %[[DIM:.+]] = torch.constant.int 2
+// CHECK:         %[[DIMS:.+]] = torch.prim.ListConstruct %[[DIM]]
+// CHECK:         %[[XSQ:.+]] = torch.aten.mul.Tensor %[[INPUT]], %[[INPUT]]
+// CHECK:         %[[MEAN:.+]] = torch.aten.mean.dim %[[XSQ]], %[[DIMS]]
+// CHECK:         %[[MPE:.+]] = torch.aten.add.Scalar %[[MEAN]], %[[EPS]]
+// CHECK:         %[[INV:.+]] = torch.aten.rsqrt %[[MPE]]
+// CHECK:         %[[NORM:.+]] = torch.aten.mul.Tensor %[[INPUT]], %[[INV]]
+// CHECK:         %[[OUT:.+]] = torch.aten.mul.Tensor %[[NORM]], %[[SCALE]]
+// CHECK:         return %[[OUT]]
 
 // -----
 
@@ -826,12 +833,17 @@ func.func @test_simplified_layer_normalization_dynamic(%arg0: !torch.vtensor<[?,
 // CHECK-LABEL: func.func @test_simplified_layer_normalization_dynamic
 // CHECK-SAME:    %[[INPUT:[a-zA-Z0-9]+]]: !torch.vtensor<[?,?,4096],f16>
 // CHECK-SAME:    %[[SCALE:[a-zA-Z0-9]+]]: !torch.vtensor<[4096],f16>
-// CHECK:         %[[UPCAST:.*]] = torch.aten.to.dtype %[[INPUT]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !torch.vtensor<[?,?,4096],f16>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[?,?,4096],f32>
-// CHECK:         %[[DIM:.+]] = torch.constant.int 4096
-// CHECK:         %[[SHAPE:.+]] = torch.prim.ListConstruct %[[DIM]]
-// CHECK:         %[[EPS:.+]] = torch.constant.float 9.9999997473787516E-6
-// CHECK:         %[[RMS:.*]] = torch.aten.rms_norm %[[UPCAST]], %[[SHAPE]], %[[SCALE]], %[[EPS]] : !torch.vtensor<[?,?,4096],f32>, !torch.list<int>, !torch.vtensor<[4096],f16>, !torch.float -> !torch.vtensor<[?,?,4096],f32>
-// CHECK:         torch.aten.to.dtype %[[RMS]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !torch.vtensor<[?,?,4096],f32>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[?,?,4096],f16>
+// stash_type=1 (f32): inputs upcast to f32, decomposed RMS norm in f32, result downcast to f16.
+// CHECK:         %[[XUP:.+]] = torch.aten.to.dtype %[[INPUT]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !torch.vtensor<[?,?,4096],f16>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[?,?,4096],f32>
+// CHECK:         %[[SUP:.+]] = torch.aten.to.dtype %[[SCALE]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !torch.vtensor<[4096],f16>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[4096],f32>
+// CHECK:         %[[XSQ:.+]] = torch.aten.mul.Tensor %[[XUP]], %[[XUP]]
+// CHECK:         %[[MEAN:.+]] = torch.aten.mean.dim %[[XSQ]]
+// CHECK:         %[[MPE:.+]] = torch.aten.add.Scalar %[[MEAN]]
+// CHECK:         %[[INV:.+]] = torch.aten.rsqrt %[[MPE]]
+// CHECK:         %[[NORM:.+]] = torch.aten.mul.Tensor %[[XUP]], %[[INV]]
+// CHECK:         %[[OUTF32:.+]] = torch.aten.mul.Tensor %[[NORM]], %[[SUP]]
+// CHECK:         %[[OUT:.+]] = torch.aten.to.dtype %[[OUTF32]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : !torch.vtensor<[?,?,4096],f32>, !torch.int, !torch.bool, !torch.bool, !torch.none -> !torch.vtensor<[?,?,4096],f16>
+// CHECK:         return %[[OUT]]
 
 // -----
 
@@ -843,12 +855,14 @@ func.func @test_skip_simplified_layer_normalization(%arg0: !torch.vtensor<[2,8,2
 // CHECK-SAME:    %[[INPUT:[a-zA-Z0-9]+]]: !torch.vtensor<[2,8,256],f32>
 // CHECK-SAME:    %[[SKIP:[a-zA-Z0-9]+]]: !torch.vtensor<[2,8,256],f32>
 // CHECK-SAME:    %[[GAMMA:[a-zA-Z0-9]+]]: !torch.vtensor<[256],f32>
-// CHECK-DAG:     %[[ONE:.+]] = torch.constant.float 1.000000e+00
-// CHECK-DAG:     %[[EPS:.+]] = torch.constant.float 9.9999997473787516E-6
+// Decomposed RMS norm over (input + skip); 2nd result is input_skip_bias_sum.
+// CHECK:         %[[ONE:.+]] = torch.constant.float 1.000000e+00
 // CHECK:         %[[SUM:.+]] = torch.aten.add.Tensor %[[INPUT]], %[[SKIP]], %[[ONE]]
-// CHECK:         %[[DIM:.+]] = torch.constant.int 256
-// CHECK:         %[[SHAPE:.+]] = torch.prim.ListConstruct %[[DIM]]
-// CHECK:         %[[OUT:.+]] = torch.aten.rms_norm %[[SUM]], %[[SHAPE]], %[[GAMMA]], %[[EPS]]
+// CHECK:         %[[XSQ:.+]] = torch.aten.mul.Tensor %[[SUM]], %[[SUM]]
+// CHECK:         %[[MEAN:.+]] = torch.aten.mean.dim %[[XSQ]]
+// CHECK:         %[[INV:.+]] = torch.aten.rsqrt
+// CHECK:         %[[NORM:.+]] = torch.aten.mul.Tensor %[[SUM]], %[[INV]]
+// CHECK:         %[[OUT:.+]] = torch.aten.mul.Tensor %[[NORM]], %[[GAMMA]]
 // CHECK:         return %[[OUT]], %[[SUM]]
 
 // -----
@@ -861,9 +875,10 @@ func.func @test_skip_simplified_layer_norm_2_outputs(%input: !torch.vtensor<[2,4
 // CHECK-SAME:    %[[INPUT:[a-zA-Z0-9]+]]: !torch.vtensor<[2,4,8],f32>
 // CHECK-SAME:    %[[SKIP:[a-zA-Z0-9]+]]: !torch.vtensor<[2,4,8],f32>
 // CHECK-SAME:    %[[GAMMA:[a-zA-Z0-9]+]]: !torch.vtensor<[8],f32>
-// CHECK:         %[[SUM:.+]] = torch.aten.add.Tensor
-// CHECK:         %[[SHAPE:.+]] = torch.prim.ListConstruct
-// CHECK:         %[[OUT:.+]] = torch.aten.rms_norm
+// CHECK:         %[[SUM:.+]] = torch.aten.add.Tensor %[[INPUT]], %[[SKIP]]
+// CHECK:         %[[XSQ:.+]] = torch.aten.mul.Tensor %[[SUM]], %[[SUM]]
+// CHECK:         %[[INV:.+]] = torch.aten.rsqrt
+// CHECK:         %[[OUT:.+]] = torch.aten.mul.Tensor %{{.*}}, %[[GAMMA]]
 // CHECK:         return %[[OUT]], %[[SUM]]
 
 // -----
