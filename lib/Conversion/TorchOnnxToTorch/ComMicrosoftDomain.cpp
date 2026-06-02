@@ -364,15 +364,17 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         Value x, scale;
         int64_t axis, stashType;
         float epsilon;
-        SmallVector<Type> resultTypes;
         if (binder.tensorOperandAtIndex(x, 0) ||
             binder.tensorOperandAtIndex(scale, 1) ||
             binder.s64IntegerAttr(axis, "axis", -1) ||
             binder.f32FloatAttr(epsilon, "epsilon", 0.00001f) ||
-            binder.s64IntegerAttr(stashType, "stash_type", 1) ||
-            binder.tensorResultTypes(resultTypes))
+            binder.s64IntegerAttr(stashType, "stash_type", 1))
           return rewriter.notifyMatchFailure(binder.op,
                                              "Failed to bind inputs/attrs");
+
+        // Read result types from the op directly: unused optional ONNX outputs
+        // are imported as !torch.none, which tensorResultTypes() rejects.
+        auto resultTypes = binder.op->getResultTypes();
 
         // ONNX outputs: Y, inv_std_var (optional).
         if (resultTypes.size() < 1 || resultTypes.size() > 2)
@@ -420,12 +422,17 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         SmallVector<Value> results;
         results.push_back(output);
         if (resultTypes.size() == 2) {
-          // Optional output 1: inv_std_var (reduced shape).
-          Value invStd = rms.invStdVar;
-          Type want = cast<Torch::ValueTensorType>(resultTypes[1]).getDtype();
-          if (want != cast<Torch::ValueTensorType>(invStd.getType()).getDtype())
-            invStd = Torch::convertTensorToDtype(rewriter, loc, invStd, want);
-          results.push_back(invStd);
+          // Optional output 1: inv_std_var (reduced shape), or none if unused.
+          if (isa<Torch::NoneType>(resultTypes[1])) {
+            results.push_back(Torch::ConstantNoneOp::create(rewriter, loc));
+          } else {
+            Value invStd = rms.invStdVar;
+            Type want = cast<Torch::ValueTensorType>(resultTypes[1]).getDtype();
+            if (want !=
+                cast<Torch::ValueTensorType>(invStd.getType()).getDtype())
+              invStd = Torch::convertTensorToDtype(rewriter, loc, invStd, want);
+            results.push_back(invStd);
+          }
         }
         rewriter.replaceOp(binder.op, results);
         return success();
@@ -437,15 +444,17 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         Value x, skip, scale;
         float epsilon;
         int64_t stashType;
-        SmallVector<Type> resultTypes;
         if (binder.tensorOperandAtIndex(x, 0) ||
             binder.tensorOperandAtIndex(skip, 1) ||
             binder.tensorOperandAtIndex(scale, 2) ||
             binder.f32FloatAttr(epsilon, "epsilon", 0.00001f) ||
-            binder.s64IntegerAttr(stashType, "stash_type", 1) ||
-            binder.tensorResultTypes(resultTypes))
+            binder.s64IntegerAttr(stashType, "stash_type", 1))
           return rewriter.notifyMatchFailure(binder.op,
                                              "Failed to bind inputs/attrs");
+
+        // Read result types from the op directly: unused optional ONNX outputs
+        // are imported as !torch.none, which tensorResultTypes() rejects.
+        auto resultTypes = binder.op->getResultTypes();
 
         // ONNX outputs (in order): output, mean, inv_std_var,
         // input_skip_bias_sum (all optional except output). We match each
@@ -521,6 +530,12 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
         SmallVector<Value> results;
         results.push_back(output);
         for (size_t i = 1; i < resultTypes.size(); i++) {
+          // Unused optional output (mean / inv_std_var / input_skip_bias_sum)
+          // is imported as !torch.none.
+          if (isa<Torch::NoneType>(resultTypes[i])) {
+            results.push_back(Torch::ConstantNoneOp::create(rewriter, loc));
+            continue;
+          }
           auto rt = cast<Torch::ValueTensorType>(resultTypes[i]);
           Value v;
           if (rt.getSizes() == fullShape) {

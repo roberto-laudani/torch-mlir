@@ -163,3 +163,29 @@ func.func @test_skip_simplified_layer_norm_with_all_intermediates(
   // CHECK:      return %[[RES]], %[[MEAN_SQ]], %[[INV_STD]], %[[SKIP_SUM]] : !torch.vtensor<[2,4,8],f32>, !torch.vtensor<[2,4,1],f32>, !torch.vtensor<[2,4,1],f32>, !torch.vtensor<[2,4,8],f32>
   return %0#0, %0#1, %0#2, %0#3 : !torch.vtensor<[2,4,8],f32>, !torch.vtensor<[2,4,1],f32>, !torch.vtensor<[2,4,1],f32>, !torch.vtensor<[2,4,8],f32>
 }
+
+// -----
+
+// Qwen3-style: 4 declared outputs where mean (1) and inv_std_var (2) are unused
+// (imported as !torch.none); only output (0) and input_skip_bias_sum (3) are
+// consumed. The binder must tolerate the !torch.none results.
+// CHECK-LABEL: @test_skip_simplified_layer_norm_none_outputs
+// CHECK-SAME:  (%[[X:.+]]: !torch.vtensor<[2,4,8],f32>, %[[SKIP:.+]]: !torch.vtensor<[2,4,8],f32>, %[[SCALE:.+]]: !torch.vtensor<[8],f32>)
+func.func @test_skip_simplified_layer_norm_none_outputs(
+  %arg0: !torch.vtensor<[2,4,8],f32>,
+  %arg1: !torch.vtensor<[2,4,8],f32>,
+  %arg2: !torch.vtensor<[8],f32>)
+  -> (!torch.vtensor<[2,4,8],f32>, !torch.vtensor<[2,4,8],f32>)
+  attributes {torch.onnx_meta.ir_version = 9 : si64, torch.onnx_meta.opset_version = 17 : si64} {
+  %0:4 = torch.operator "onnx.SkipSimplifiedLayerNormalization"(%arg0, %arg1, %arg2)
+           {torch.onnx.epsilon = 9.99999974E-6 : f32}
+           : (!torch.vtensor<[2,4,8],f32>, !torch.vtensor<[2,4,8],f32>, !torch.vtensor<[8],f32>)
+           -> (!torch.vtensor<[2,4,8],f32>, !torch.none, !torch.none, !torch.vtensor<[2,4,8],f32>)
+  // CHECK:      %[[SUM:.+]] = torch.aten.add.Tensor %[[X]], %[[SKIP]]
+  // CHECK:      %[[XSQ:.+]] = torch.aten.mul.Tensor %[[SUM]], %[[SUM]]
+  // CHECK:      %[[INV:.+]] = torch.aten.rsqrt
+  // CHECK:      %[[NORM:.+]] = torch.aten.mul.Tensor %[[SUM]], %[[INV]]
+  // CHECK:      %[[OUT:.+]] = torch.aten.mul.Tensor %[[NORM]], %[[SCALE]]
+  // CHECK:      return %[[OUT]], %[[SUM]]
+  return %0#0, %0#3 : !torch.vtensor<[2,4,8],f32>, !torch.vtensor<[2,4,8],f32>
+}
