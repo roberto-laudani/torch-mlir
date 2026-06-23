@@ -13,7 +13,7 @@ func.func @test_rotary_embedding(%arg0: !torch.vtensor<[1,4,2,16],f32>, %arg1: !
 
   // CHECK:     %[[INIT_TENSOR:.*]] = tensor.empty(
   // CHECK:     %[[ZERO_F32:.*]] = arith.constant 0.000000e+00 : f32
-  // CHECK:     %[[FILLED_TENSOR:.*]] = linalg.fill ins(%[[ZERO_F32]] : f32) outs(%[[INIT_TENSOR]] : tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+  // CHECK:     %[[FILLED_TENSOR:.*]] = linalg.fill ins(%[[ZERO_F32]] : f32) outs(%[[INIT_TENSOR]] : tensor<1x4x2x16xf32>) -> tensor<1x4x2x16xf32>
 
   // CHECK-DAG: %[[EMBED_HALF_BASE_IDX:.*]] = arith.constant 8 : index
   // CHECK-DAG: %[[EMBED_SIZE_IDX:.*]] = arith.constant 16 : index
@@ -22,7 +22,7 @@ func.func @test_rotary_embedding(%arg0: !torch.vtensor<[1,4,2,16],f32>, %arg1: !
 
   // CHECK:     %[[GENERIC:.*]] = linalg.generic
   // CHECK-SAME:   ins(%[[X_T]], %[[POS_T]] : tensor<1x4x2x16xf32>, tensor<1x2xi64>)
-  // CHECK-SAME:   outs(%[[FILLED_TENSOR]] : tensor<?x?x?x?xf32>) {
+  // CHECK-SAME:   outs(%[[FILLED_TENSOR]] : tensor<1x4x2x16xf32>) {
   // CHECK:     ^bb0(%[[X_ELEM:.*]]: f32, %[[POS_ELEM:.*]]: i64, %[[OUT_INIT:.*]]: f32):
   // CHECK:       %[[BATCH_INDEX:.*]] = linalg.index 0 : index
   // CHECK:       %[[HEAD_INDEX:.*]] = linalg.index 1 : index
@@ -42,9 +42,9 @@ func.func @test_rotary_embedding(%arg0: !torch.vtensor<[1,4,2,16],f32>, %arg1: !
   // CHECK:       %[[PROD2S:.*]] = arith.mulf %[[PROD2]], %[[SIGN]] : f32
   // CHECK:       %[[SUM:.*]] = arith.addf %[[PROD1]], %[[PROD2S]] : f32
   // CHECK:       linalg.yield %[[SUM]] : f32
-  // CHECK:     } -> tensor<?x?x?x?xf32>
+  // CHECK:     } -> tensor<1x4x2x16xf32>
 
-  // CHECK:     %[[CAST:.*]] = tensor.cast %[[GENERIC]] : tensor<?x?x?x?xf32> to tensor<1x4x2x16xf32>
+  // CHECK:     %[[CAST:.*]] = tensor.cast %[[GENERIC]] : tensor<1x4x2x16xf32> to tensor<1x4x2x16xf32>
   // CHECK:     %[[RET_VT:.*]] = torch_c.from_builtin_tensor %[[CAST]] : tensor<1x4x2x16xf32> -> !torch.vtensor<[1,4,2,16],f32>
   // CHECK:     return %[[RET_VT]] : !torch.vtensor<[1,4,2,16],f32>
   %int0 = torch.constant.int 0
@@ -71,7 +71,7 @@ func.func @test_rotary_embedding_dynamic(%arg0: !torch.vtensor<[?,3,?,6],f32>, %
 
   // CHECK:     %[[INIT_TENSOR_D:.*]] = tensor.empty(
   // CHECK:     %[[ZERO_F32_D:.*]] = arith.constant 0.000000e+00 : f32
-  // CHECK:     %[[FILLED_TENSOR_D:.*]] = linalg.fill ins(%[[ZERO_F32_D]] : f32) outs(%[[INIT_TENSOR_D]] : tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+  // CHECK:     %[[FILLED_TENSOR_D:.*]] = linalg.fill ins(%[[ZERO_F32_D]] : f32) outs(%[[INIT_TENSOR_D]] : tensor<?x3x?x6xf32>) -> tensor<?x3x?x6xf32>
 
   // CHECK-DAG: %[[EMBED_HALF_BASE_IDX_D:.*]] = arith.constant 3 : index
   // CHECK-DAG: %[[EMBED_SIZE_IDX_D:.*]] = arith.constant 6 : index
@@ -80,7 +80,7 @@ func.func @test_rotary_embedding_dynamic(%arg0: !torch.vtensor<[?,3,?,6],f32>, %
 
   // CHECK:     %[[GENERIC_D:.*]] = linalg.generic
   // CHECK-SAME:   ins(%[[X_T_D]], %[[POS_T_D]] : tensor<?x3x?x6xf32>, tensor<?x?xi64>)
-  // CHECK-SAME:   outs(%[[FILLED_TENSOR_D]] : tensor<?x?x?x?xf32>) {
+  // CHECK-SAME:   outs(%[[FILLED_TENSOR_D]] : tensor<?x3x?x6xf32>) {
   // CHECK:     ^bb0(%[[X_ELEM_D:.*]]: f32, %[[POS_ELEM_D:.*]]: i64, %[[OUT_INIT_D:.*]]: f32):
   // CHECK:       %[[BATCH_INDEX_D:.*]] = linalg.index 0 : index
   // CHECK:       %[[HEAD_INDEX_D:.*]] = linalg.index 1 : index
@@ -100,9 +100,9 @@ func.func @test_rotary_embedding_dynamic(%arg0: !torch.vtensor<[?,3,?,6],f32>, %
   // CHECK:       %[[PROD2S_D:.*]] = arith.mulf %[[PROD2_D]], %[[SIGN_D]] : f32
   // CHECK:       %[[SUM_D:.*]] = arith.addf %[[PROD1_D]], %[[PROD2S_D]] : f32
   // CHECK:       linalg.yield %[[SUM_D]] : f32
-  // CHECK:     } -> tensor<?x?x?x?xf32>
+  // CHECK:     } -> tensor<?x3x?x6xf32>
 
-  // CHECK:     %[[CAST_D:.*]] = tensor.cast %[[GENERIC_D]] : tensor<?x?x?x?xf32> to tensor<?x3x?x6xf32>
+  // CHECK:     %[[CAST_D:.*]] = tensor.cast %[[GENERIC_D]] : tensor<?x3x?x6xf32> to tensor<?x3x?x6xf32>
   // CHECK:     %[[RET_VT_D:.*]] = torch_c.from_builtin_tensor %[[CAST_D]] : tensor<?x3x?x6xf32> -> !torch.vtensor<[?,3,?,6],f32>
   // CHECK:     return %[[RET_VT_D]] : !torch.vtensor<[?,3,?,6],f32>
   %int0 = torch.constant.int 0
@@ -134,7 +134,7 @@ func.func @test_rotary_embedding_3d_dynamic(%arg0: !torch.vtensor<[?,?,24],f32>,
 
   // CHECK:     %[[INIT3D:.*]] = tensor.empty(
   // CHECK:     %[[ZERO3D:.*]] = arith.constant 0.000000e+00 : f32
-  // CHECK:     %[[FILLED3D:.*]] = linalg.fill ins(%[[ZERO3D]] : f32) outs(%[[INIT3D]] : tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+  // CHECK:     %[[FILLED3D:.*]] = linalg.fill ins(%[[ZERO3D]] : f32) outs(%[[INIT3D]] : tensor<?x4x?x6xf32>) -> tensor<?x4x?x6xf32>
 
   // CHECK-DAG: %[[EMBED_HALF_BASE_IDX3:.*]] = arith.constant 3 : index
   // CHECK-DAG: %[[EMBED_SIZE_IDX3:.*]] = arith.constant 6 : index
@@ -143,7 +143,7 @@ func.func @test_rotary_embedding_3d_dynamic(%arg0: !torch.vtensor<[?,?,24],f32>,
 
   // CHECK:     %[[GENERIC_3D:.*]] = linalg.generic
   // CHECK-SAME:   ins(%[[RESHAPED4D]], %[[POS_T3]] : tensor<?x4x?x6xf32>, tensor<?x?xi64>)
-  // CHECK-SAME:   outs(%[[FILLED3D]] : tensor<?x?x?x?xf32>) {
+  // CHECK-SAME:   outs(%[[FILLED3D]] : tensor<?x4x?x6xf32>) {
   // CHECK:     ^bb0(%[[X_ELEM3:.*]]: f32, %[[POS_ELEM3:.*]]: i64, %[[OUT_INIT3:.*]]: f32):
   // CHECK:       %[[BATCH_IDX3:.*]] = linalg.index 0 : index
   // CHECK:       %[[HEAD_IDX3:.*]] = linalg.index 1 : index
@@ -163,10 +163,10 @@ func.func @test_rotary_embedding_3d_dynamic(%arg0: !torch.vtensor<[?,?,24],f32>,
   // CHECK:       %[[PROD2S_3:.*]] = arith.mulf %[[PROD2_3]], %[[SIGN3]] : f32
   // CHECK:       %[[SUM3:.*]] = arith.addf %[[PROD1_3]], %[[PROD2S_3]] : f32
   // CHECK:       linalg.yield %[[SUM3]] : f32
-  // CHECK:     } -> tensor<?x?x?x?xf32>
+  // CHECK:     } -> tensor<?x4x?x6xf32>
 
   // COM: Restore the original 3D shape.
-  // CHECK:     %[[CAST3:.*]] = tensor.cast %[[GENERIC_3D]] : tensor<?x?x?x?xf32> to tensor<?x4x?x6xf32>
+  // CHECK:     %[[CAST3:.*]] = tensor.cast %[[GENERIC_3D]] : tensor<?x4x?x6xf32> to tensor<?x4x?x6xf32>
   // CHECK:     %[[TRANSPOSE_INIT2:.*]] = tensor.empty(%{{.*}}, %{{.*}}) : tensor<?x?x4x6xf32>
   // CHECK:     %[[RESHAPE_BACK:.*]] = linalg.transpose ins(%[[CAST3]] : tensor<?x4x?x6xf32>) outs(%[[TRANSPOSE_INIT2]] : tensor<?x?x4x6xf32>) permutation = [0, 2, 1, 3]
   // CHECK:     %[[COLLAPSED3:.*]] = tensor.collapse_shape %[[RESHAPE_BACK]] {{\[\[}}0], [1], [2, 3]] : tensor<?x?x4x6xf32> into tensor<?x?x24xf32>

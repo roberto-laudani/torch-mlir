@@ -12,6 +12,7 @@
 
 #include "PopulatePatterns.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -3908,13 +3909,19 @@ private:
     auto elementType = preprocessedInputType.getElementType();
     unsigned inputRank = preprocessedInputType.getRank();
 
-    SmallVector<Value> resultShape;
-    for (int64_t i = 0; i < inputRank; i++) {
-      auto currentDimSize = tensor::DimOp::create(rewriter, loc, preprocessedInput, i);
-      resultShape.push_back(currentDimSize);
-    }
+    // Preserve statically-known dims of the (rank-4) working tensor: only emit
+    // tensor.dim for genuinely dynamic dims. getMixedSizes returns an Attr for
+    // static dims and a tensor.dim Value for dynamic ones, so the init/compute
+    // tensor keeps shapes like ?x4x?x6 instead of collapsing to ?x?x?x?, which
+    // would pessimize downstream tiling/vectorization and force a trailing cast.
+    SmallVector<OpFoldResult> resultDims =
+        tensor::getMixedSizes(rewriter, loc, preprocessedInput);
+    Value emptyTensor =
+        tensor::EmptyOp::create(rewriter, loc, resultDims, elementType);
+    Value cstZero = arith::ConstantOp::create(
+        rewriter, loc, rewriter.getZeroAttr(elementType));
     Value outTensor =
-        createZeroInitTensor(rewriter, loc, resultShape, elementType);
+        linalg::FillOp::create(rewriter, loc, cstZero, emptyTensor).getResult(0);
 
     Value cstFloatOne = arith::ConstantOp::create(
         rewriter, loc, rewriter.getFloatAttr(elementType, 1.0));

@@ -61,6 +61,102 @@ func.func @torch.aten.matmul.4d(%arg0: !torch.vtensor<[1,2,32,400],f32>, %arg1: 
 
 // -----
 
+// CHECK-LABEL: func.func @torch.aten.matmul$dot_f16
+// CHECK:      %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:      linalg.dot ins(%{{.*}}, %{{.*}} : tensor<4xf16>, tensor<4xf16>) outs(%{{.*}} : tensor<f32>) -> tensor<f32>
+// CHECK:      arith.truncf %{{.*}} : f32 to f16
+func.func @torch.aten.matmul$dot_f16(%arg0: !torch.vtensor<[4],f16>, %arg1: !torch.vtensor<[4],f16>) -> !torch.vtensor<[],f16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[4],f16>, !torch.vtensor<[4],f16> -> !torch.vtensor<[],f16>
+  return %0 : !torch.vtensor<[],f16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.matmul$vecmat_f16
+// CHECK:      %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:      linalg.vecmat ins(%{{.*}}, %{{.*}} : tensor<4xf16>, tensor<4x8xf16>) outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
+// CHECK:      arith.truncf %{{.*}} : f32 to f16
+func.func @torch.aten.matmul$vecmat_f16(%arg0: !torch.vtensor<[4],f16>, %arg1: !torch.vtensor<[4,8],f16>) -> !torch.vtensor<[8],f16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[4],f16>, !torch.vtensor<[4,8],f16> -> !torch.vtensor<[8],f16>
+  return %0 : !torch.vtensor<[8],f16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.matmul$matvec_f16
+// CHECK:      %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:      linalg.matvec ins(%{{.*}}, %{{.*}} : tensor<8x4xf16>, tensor<4xf16>) outs(%{{.*}} : tensor<8xf32>) -> tensor<8xf32>
+// CHECK:      arith.truncf %{{.*}} : f32 to f16
+func.func @torch.aten.matmul$matvec_f16(%arg0: !torch.vtensor<[8,4],f16>, %arg1: !torch.vtensor<[4],f16>) -> !torch.vtensor<[8],f16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[8,4],f16>, !torch.vtensor<[4],f16> -> !torch.vtensor<[8],f16>
+  return %0 : !torch.vtensor<[8],f16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.matmul$2d_f16
+// CHECK:      %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:      linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<8x16xf16>, tensor<16x8xf16>) outs(%{{.*}} : tensor<8x8xf32>) -> tensor<8x8xf32>
+// CHECK:      arith.truncf %{{.*}} : f32 to f16
+func.func @torch.aten.matmul$2d_f16(%arg0: !torch.vtensor<[8,16],f16>, %arg1: !torch.vtensor<[16,8],f16>) -> !torch.vtensor<[8,8],f16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[8,16],f16>, !torch.vtensor<[16,8],f16> -> !torch.vtensor<[8,8],f16>
+  return %0 : !torch.vtensor<[8,8],f16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.matmul$3d_f16
+// CHECK:      %[[BMM:.+]] = linalg.batch_matmul ins(%{{.*}}, %{{.*}} : tensor<2x8x16xf16>, tensor<2x16x8xf16>) outs(%{{.*}} : tensor<2x8x8xf32>) -> tensor<2x8x8xf32>
+// CHECK:      arith.truncf %{{.*}} : f32 to f16
+func.func @torch.aten.matmul$3d_f16(%arg0: !torch.vtensor<[2,8,16],f16>, %arg1: !torch.vtensor<[2,16,8],f16>) -> !torch.vtensor<[2,8,8],f16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[2,8,16],f16>, !torch.vtensor<[2,16,8],f16> -> !torch.vtensor<[2,8,8],f16>
+  return %0 : !torch.vtensor<[2,8,8],f16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.matmul$4d_f16
+// CHECK:      %[[COLLAPSED_LHS:.+]] = tensor.collapse_shape %{{.*}} {{\[\[}}0, 1], [2], [3]] : tensor<1x2x8x16xf16> into tensor<2x8x16xf16>
+// CHECK:      %[[COLLAPSED_RHS:.+]] = tensor.collapse_shape %{{.*}} {{\[\[}}0, 1], [2], [3]] : tensor<1x2x16x8xf16> into tensor<2x16x8xf16>
+// CHECK:      %[[BMM:.+]] = linalg.batch_matmul ins(%[[COLLAPSED_LHS]], %[[COLLAPSED_RHS]] : tensor<2x8x16xf16>, tensor<2x16x8xf16>) outs(%{{.*}} : tensor<2x8x8xf32>) -> tensor<2x8x8xf32>
+// CHECK:      arith.truncf %{{.*}} : f32 to f16
+// CHECK:      tensor.expand_shape %{{.*}} {{\[\[}}0, 1], [2], [3]] output_shape [1, 2, 8, 8] : tensor<2x8x8xf16> into tensor<1x2x8x8xf16>
+func.func @torch.aten.matmul$4d_f16(%arg0: !torch.vtensor<[1,2,8,16],f16>, %arg1: !torch.vtensor<[1,2,16,8],f16>) -> !torch.vtensor<[1,2,8,8],f16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[1,2,8,16],f16>, !torch.vtensor<[1,2,16,8],f16> -> !torch.vtensor<[1,2,8,8],f16>
+  return %0 : !torch.vtensor<[1,2,8,8],f16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.matmul$2d_bf16
+// CHECK:      %[[ZERO:.+]] = arith.constant 0.000000e+00 : f32
+// CHECK:      linalg.matmul ins(%{{.*}}, %{{.*}} : tensor<8x16xbf16>, tensor<16x8xbf16>) outs(%{{.*}} : tensor<8x8xf32>) -> tensor<8x8xf32>
+// CHECK:      arith.truncf %{{.*}} : f32 to bf16
+func.func @torch.aten.matmul$2d_bf16(%arg0: !torch.vtensor<[8,16],bf16>, %arg1: !torch.vtensor<[16,8],bf16>) -> !torch.vtensor<[8,8],bf16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[8,16],bf16>, !torch.vtensor<[16,8],bf16> -> !torch.vtensor<[8,8],bf16>
+  return %0 : !torch.vtensor<[8,8],bf16>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.matmul$generic_f16
+// CHECK:      linalg.generic
+// CHECK-SAME: ins(%{{.*}}, %{{.*}} : tensor<?x?x8x16xf16>, tensor<?x?x16x8xf16>)
+// CHECK-SAME: outs(%{{.*}} : tensor<?x?x8x8xf32>)
+// CHECK:      ^bb0(%[[A:.+]]: f16, %[[B:.+]]: f16, %[[C:.+]]: f32):
+// CHECK:        %[[EA:.+]] = arith.extf %[[A]] : f16 to f32
+// CHECK:        %[[EB:.+]] = arith.extf %[[B]] : f16 to f32
+// CHECK:        %[[MUL:.+]] = arith.mulf %[[EA]], %[[EB]] : f32
+// CHECK:        %[[ADD:.+]] = arith.addf %[[MUL]], %[[C]] : f32
+// CHECK:        linalg.yield %[[ADD]] : f32
+// CHECK:      arith.truncf %{{.*}} : f32 to f16
+func.func @torch.aten.matmul$generic_f16(%arg0: !torch.vtensor<[?,?,8,16],f16>, %arg1: !torch.vtensor<[?,?,16,8],f16>) -> !torch.vtensor<[?,?,8,8],f16> {
+  %0 = torch.aten.matmul %arg0, %arg1 : !torch.vtensor<[?,?,8,16],f16>, !torch.vtensor<[?,?,16,8],f16> -> !torch.vtensor<[?,?,8,8],f16>
+  return %0 : !torch.vtensor<[?,?,8,8],f16>
+}
+
+// -----
+
 // CHECK-LABEL: func.func @torch.aten.mm$basic_strict(
 // CHECK-NOT: assert
 func.func @torch.aten.mm$basic_strict(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?,2],f32>
@@ -451,24 +547,84 @@ func.func @test_rotary_embedding(%arg0: !torch.vtensor<[1,3,2,6],f32>, %arg1: !t
   // CHECK:           %[[VAL_11:.*]] = torch.constant.int 0
   // CHECK:           %[[VAL_12:.*]] = torch.constant.int 0
   // CHECK:           %[[VAL_13:.*]] = torch.constant.float 1.000000e+00
+  // CHECK:           %[[VAL_14:.*]] = tensor.empty() : tensor<1x3x2x6xf32>
+  // CHECK:           %[[VAL_15:.*]] = arith.constant 0.000000e+00 : f32
+  // CHECK:           %[[VAL_16:.*]] = linalg.fill ins(%[[VAL_15]] : f32) outs(%[[VAL_14]] : tensor<1x3x2x6xf32>) -> tensor<1x3x2x6xf32>
+  // CHECK:           %[[VAL_17:.*]] = arith.constant 1.000000e+00 : f32
+  // CHECK:           %[[VAL_18:.*]] = arith.constant -1.000000e+00 : f32
+  // CHECK:           %[[VAL_19:.*]] = arith.constant 2 : index
+  // CHECK:           %[[VAL_20:.*]] = arith.constant 1 : index
+  // CHECK:           %[[VAL_21:.*]] = arith.constant 6 : index
+  // CHECK:           %[[VAL_22:.*]] = arith.constant 3 : index
+  // CHECK:           %[[VAL_23:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%[[VAL_7]], %[[VAL_6]] : tensor<1x3x2x6xf32>, tensor<1x2xi64>) outs(%[[VAL_16]] : tensor<1x3x2x6xf32>) {
+  // CHECK:           ^bb0(%[[VAL_24:.*]]: f32, %[[VAL_25:.*]]: i64, %[[VAL_26:.*]]: f32):
+  // CHECK:             %[[VAL_27:.*]] = linalg.index 0 : index
+  // CHECK:             %[[VAL_28:.*]] = linalg.index 1 : index
+  // CHECK:             %[[VAL_29:.*]] = linalg.index 2 : index
+  // CHECK:             %[[VAL_30:.*]] = linalg.index 3 : index
+  // CHECK:             %[[VAL_31:.*]] = arith.remsi %[[VAL_30]], %[[VAL_22]] : index
+  // CHECK:             %[[VAL_32:.*]] = arith.cmpi sge, %[[VAL_30]], %[[VAL_22]] : index
+  // CHECK:             %[[VAL_33:.*]] = arith.addi %[[VAL_30]], %[[VAL_22]] : index
+  // CHECK:             %[[VAL_34:.*]] = arith.remsi %[[VAL_33]], %[[VAL_21]] : index
+  // CHECK:             %[[VAL_35:.*]] = arith.index_cast %[[VAL_25]] : i64 to index
+  // CHECK:             %[[VAL_36:.*]] = tensor.extract %[[VAL_5]]{{\[}}%[[VAL_35]], %[[VAL_31]]] : tensor<4x3xf32>
+  // CHECK:             %[[VAL_37:.*]] = tensor.extract %[[VAL_4]]{{\[}}%[[VAL_35]], %[[VAL_31]]] : tensor<4x3xf32>
+  // CHECK:             %[[VAL_38:.*]] = tensor.extract %[[VAL_7]]{{\[}}%[[VAL_27]], %[[VAL_28]], %[[VAL_29]], %[[VAL_34]]] : tensor<1x3x2x6xf32>
+  // CHECK:             %[[VAL_39:.*]] = arith.select %[[VAL_32]], %[[VAL_17]], %[[VAL_18]] : f32
+  // CHECK:             %[[VAL_40:.*]] = arith.mulf %[[VAL_24]], %[[VAL_36]] : f32
+  // CHECK:             %[[VAL_41:.*]] = arith.mulf %[[VAL_38]], %[[VAL_37]] : f32
+  // CHECK:             %[[VAL_42:.*]] = arith.mulf %[[VAL_41]], %[[VAL_39]] : f32
+  // CHECK:             %[[VAL_43:.*]] = arith.addf %[[VAL_40]], %[[VAL_42]] : f32
+  // CHECK:             linalg.yield %[[VAL_43]] : f32
+  // CHECK:           } -> tensor<1x3x2x6xf32>
+  // CHECK:           %[[VAL_44:.*]] = tensor.cast %[[VAL_23]] : tensor<1x3x2x6xf32> to tensor<1x3x2x6xf32>
+  // CHECK:           %[[VAL_45:.*]] = torch_c.from_builtin_tensor %[[VAL_44]] : tensor<1x3x2x6xf32> -> !torch.vtensor<[1,3,2,6],f32>
+  // CHECK:           return %[[VAL_45]] : !torch.vtensor<[1,3,2,6],f32>
+  %none = torch.constant.none
+  %int0 = torch.constant.int 0
+  %int0_0 = torch.constant.int 0
+  %int0_1 = torch.constant.int 0
+  %int0_2 = torch.constant.int 0
+  %float1.000000e00 = torch.constant.float 1.000000e+00
+  %4 = torch.onnx.rotary_embedding %arg0, %arg1, %arg2, %arg3, %int0, %int0_0, %int0_1, %int0_2, %float1.000000e00 : !torch.vtensor<[1,3,2,6],f32>, !torch.vtensor<[1,2],si64>, !torch.vtensor<[4,3],f32>, !torch.vtensor<[4,3],f32>, !torch.int, !torch.int, !torch.int, !torch.int, !torch.float -> !torch.vtensor<[1,3,2,6],f32>
+  return %4 : !torch.vtensor<[1,3,2,6],f32>
+}
+
+// -----
+
+// Test rotary embedding with dynamic batch and sequence dimensions (rank 4)
+// Input shape: [batch, num_heads, seq, head_size] = [?, 1, ?, 6]
+// batch (dim 0) and seq (dim 2) are dynamic; num_heads (dim 1) and head_size (dim 3) must be static
+// CHECK-LABEL:   func.func @test_rotary_embedding_dynamic(
+// CHECK-SAME:                                     %[[VAL_0:.*]]: !torch.vtensor<[?,1,?,6],f32>,
+// CHECK-SAME:                                     %[[VAL_1:.*]]: !torch.vtensor<[?,?],si64>,
+// CHECK-SAME:                                     %[[VAL_2:.*]]: !torch.vtensor<[4,3],f32>,
+// CHECK-SAME:                                     %[[VAL_3:.*]]: !torch.vtensor<[4,3],f32>) -> !torch.vtensor<[?,1,?,6],f32>
+func.func @test_rotary_embedding_dynamic(%arg0: !torch.vtensor<[?,1,?,6],f32>, %arg1: !torch.vtensor<[?,?],si64>, %arg2: !torch.vtensor<[4,3],f32>, %arg3: !torch.vtensor<[4,3],f32>) -> !torch.vtensor<[?,1,?,6],f32> attributes {torch.onnx_meta.ir_version = 10 : si64, torch.onnx_meta.opset_version = 22 : si64, torch.onnx_meta.producer_name = "", torch.onnx_meta.producer_version = ""} {
+  // CHECK:           %[[VAL_4:.*]] = torch_c.to_builtin_tensor %[[VAL_3]] : !torch.vtensor<[4,3],f32> -> tensor<4x3xf32>
+  // CHECK:           %[[VAL_5:.*]] = torch_c.to_builtin_tensor %[[VAL_2]] : !torch.vtensor<[4,3],f32> -> tensor<4x3xf32>
+  // CHECK:           %[[VAL_6:.*]] = torch_c.to_builtin_tensor %[[VAL_1]] : !torch.vtensor<[?,?],si64> -> tensor<?x?xi64>
+  // CHECK:           %[[VAL_7:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[?,1,?,6],f32> -> tensor<?x1x?x6xf32>
+  // CHECK:           %[[VAL_8:.*]] = torch.constant.none
+  // CHECK:           %[[VAL_9:.*]] = torch.constant.int 0
+  // CHECK:           %[[VAL_10:.*]] = torch.constant.int 0
+  // CHECK:           %[[VAL_11:.*]] = torch.constant.int 0
+  // CHECK:           %[[VAL_12:.*]] = torch.constant.int 0
+  // CHECK:           %[[VAL_13:.*]] = torch.constant.float 1.000000e+00
   // CHECK:           %[[VAL_14:.*]] = arith.constant 0 : index
-  // CHECK:           %[[VAL_15:.*]] = tensor.dim %[[VAL_7]], %[[VAL_14]] : tensor<1x3x2x6xf32>
-  // CHECK:           %[[VAL_16:.*]] = arith.constant 1 : index
-  // CHECK:           %[[VAL_17:.*]] = tensor.dim %[[VAL_7]], %[[VAL_16]] : tensor<1x3x2x6xf32>
-  // CHECK:           %[[VAL_18:.*]] = arith.constant 2 : index
-  // CHECK:           %[[VAL_19:.*]] = tensor.dim %[[VAL_7]], %[[VAL_18]] : tensor<1x3x2x6xf32>
-  // CHECK:           %[[VAL_20:.*]] = arith.constant 3 : index
-  // CHECK:           %[[VAL_21:.*]] = tensor.dim %[[VAL_7]], %[[VAL_20]] : tensor<1x3x2x6xf32>
-  // CHECK:           %[[VAL_22:.*]] = tensor.empty(%[[VAL_15]], %[[VAL_17]], %[[VAL_19]], %[[VAL_21]]) : tensor<?x?x?x?xf32>
+  // CHECK:           %[[VAL_15:.*]] = tensor.dim %[[VAL_7]], %[[VAL_14]] : tensor<?x1x?x6xf32>
+  // CHECK:           %[[VAL_16:.*]] = arith.constant 2 : index
+  // CHECK:           %[[VAL_17:.*]] = tensor.dim %[[VAL_7]], %[[VAL_16]] : tensor<?x1x?x6xf32>
+  // CHECK:           %[[VAL_22:.*]] = tensor.empty(%[[VAL_15]], %[[VAL_17]]) : tensor<?x1x?x6xf32>
   // CHECK:           %[[VAL_23:.*]] = arith.constant 0.000000e+00 : f32
-  // CHECK:           %[[VAL_24:.*]] = linalg.fill ins(%[[VAL_23]] : f32) outs(%[[VAL_22]] : tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+  // CHECK:           %[[VAL_24:.*]] = linalg.fill ins(%[[VAL_23]] : f32) outs(%[[VAL_22]] : tensor<?x1x?x6xf32>) -> tensor<?x1x?x6xf32>
   // CHECK:           %[[VAL_25:.*]] = arith.constant 1.000000e+00 : f32
   // CHECK:           %[[VAL_26:.*]] = arith.constant -1.000000e+00 : f32
   // CHECK:           %[[VAL_27:.*]] = arith.constant 2 : index
   // CHECK:           %[[VAL_28:.*]] = arith.constant 1 : index
   // CHECK:           %[[VAL_29:.*]] = arith.constant 6 : index
   // CHECK:           %[[VAL_30:.*]] = arith.constant 3 : index
-  // CHECK:           %[[VAL_31:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%[[VAL_7]], %[[VAL_6]] : tensor<1x3x2x6xf32>, tensor<1x2xi64>) outs(%[[VAL_24]] : tensor<?x?x?x?xf32>) {
+  // CHECK:           %[[VAL_31:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]], #[[$ATTR_0]]], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%[[VAL_7]], %[[VAL_6]] : tensor<?x1x?x6xf32>, tensor<?x?xi64>) outs(%[[VAL_24]] : tensor<?x1x?x6xf32>) {
   // CHECK:           ^bb0(%[[VAL_32:.*]]: f32, %[[VAL_33:.*]]: i64, %[[VAL_34:.*]]: f32):
   // CHECK:             %[[VAL_35:.*]] = linalg.index 0 : index
   // CHECK:             %[[VAL_36:.*]] = linalg.index 1 : index
@@ -481,25 +637,25 @@ func.func @test_rotary_embedding(%arg0: !torch.vtensor<[1,3,2,6],f32>, %arg1: !t
   // CHECK:             %[[VAL_43:.*]] = arith.index_cast %[[VAL_33]] : i64 to index
   // CHECK:             %[[VAL_44:.*]] = tensor.extract %[[VAL_5]]{{\[}}%[[VAL_43]], %[[VAL_39]]] : tensor<4x3xf32>
   // CHECK:             %[[VAL_45:.*]] = tensor.extract %[[VAL_4]]{{\[}}%[[VAL_43]], %[[VAL_39]]] : tensor<4x3xf32>
-  // CHECK:             %[[VAL_46:.*]] = tensor.extract %[[VAL_7]]{{\[}}%[[VAL_35]], %[[VAL_36]], %[[VAL_37]], %[[VAL_42]]] : tensor<1x3x2x6xf32>
+  // CHECK:             %[[VAL_46:.*]] = tensor.extract %[[VAL_7]]{{\[}}%[[VAL_35]], %[[VAL_36]], %[[VAL_37]], %[[VAL_42]]] : tensor<?x1x?x6xf32>
   // CHECK:             %[[VAL_47:.*]] = arith.select %[[VAL_40]], %[[VAL_25]], %[[VAL_26]] : f32
   // CHECK:             %[[VAL_48:.*]] = arith.mulf %[[VAL_32]], %[[VAL_44]] : f32
   // CHECK:             %[[VAL_49:.*]] = arith.mulf %[[VAL_46]], %[[VAL_45]] : f32
   // CHECK:             %[[VAL_50:.*]] = arith.mulf %[[VAL_49]], %[[VAL_47]] : f32
   // CHECK:             %[[VAL_51:.*]] = arith.addf %[[VAL_48]], %[[VAL_50]] : f32
   // CHECK:             linalg.yield %[[VAL_51]] : f32
-  // CHECK:           } -> tensor<?x?x?x?xf32>
-  // CHECK:           %[[VAL_52:.*]] = tensor.cast %[[VAL_31]] : tensor<?x?x?x?xf32> to tensor<1x3x2x6xf32>
-  // CHECK:           %[[VAL_53:.*]] = torch_c.from_builtin_tensor %[[VAL_52]] : tensor<1x3x2x6xf32> -> !torch.vtensor<[1,3,2,6],f32>
-  // CHECK:           return %[[VAL_53]] : !torch.vtensor<[1,3,2,6],f32>
+  // CHECK:           } -> tensor<?x1x?x6xf32>
+  // CHECK:           %[[VAL_52:.*]] = tensor.cast %[[VAL_31]] : tensor<?x1x?x6xf32> to tensor<?x1x?x6xf32>
+  // CHECK:           %[[VAL_53:.*]] = torch_c.from_builtin_tensor %[[VAL_52]] : tensor<?x1x?x6xf32> -> !torch.vtensor<[?,1,?,6],f32>
+  // CHECK:           return %[[VAL_53]] : !torch.vtensor<[?,1,?,6],f32>
   %none = torch.constant.none
   %int0 = torch.constant.int 0
   %int0_0 = torch.constant.int 0
   %int0_1 = torch.constant.int 0
   %int0_2 = torch.constant.int 0
   %float1.000000e00 = torch.constant.float 1.000000e+00
-  %4 = torch.onnx.rotary_embedding %arg0, %arg1, %arg2, %arg3, %int0, %int0_0, %int0_1, %int0_2, %float1.000000e00 : !torch.vtensor<[1,3,2,6],f32>, !torch.vtensor<[1,2],si64>, !torch.vtensor<[4,3],f32>, !torch.vtensor<[4,3],f32>, !torch.int, !torch.int, !torch.int, !torch.int, !torch.float -> !torch.vtensor<[1,3,2,6],f32>
-  return %4 : !torch.vtensor<[1,3,2,6],f32>
+  %4 = torch.onnx.rotary_embedding %arg0, %arg1, %arg2, %arg3, %int0, %int0_0, %int0_1, %int0_2, %float1.000000e00 : !torch.vtensor<[?,1,?,6],f32>, !torch.vtensor<[?,?],si64>, !torch.vtensor<[4,3],f32>, !torch.vtensor<[4,3],f32>, !torch.int, !torch.int, !torch.int, !torch.int, !torch.float -> !torch.vtensor<[?,1,?,6],f32>
+  return %4 : !torch.vtensor<[?,1,?,6],f32>
 }
 
 // -----
@@ -627,4 +783,44 @@ func.func @torch.aten.max.dim$basic(%arg0: tensor<3x2x3xf32>) -> tensor<3x2x1xf3
   %values, %indices = torch.aten.max.dim %0, %int2, %true : !torch.vtensor<[3,2,3],f32>, !torch.int, !torch.bool -> !torch.vtensor<[3,2,1],f32>, !torch.vtensor<[3,2,1],si64>
   %1 = torch_c.to_builtin_tensor %values : !torch.vtensor<[3,2,1],f32> -> tensor<3x2x1xf32>
   return %1 : tensor<3x2x1xf32>
+}
+
+
+// -----
+
+
+// CHECK-DAG: #[[$MAP:.*]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+// CHECK-DAG: #[[$MAP1:.*]] = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, 0)>
+// CHECK-LABEL: func.func @torch.ops.aten.anydim$basic(
+// CHECK-SAME:    %[[ARG0:.*]]: tensor<1x16x26x26xi1>) -> !torch.vtensor<[1,16,26,1],i1>
+// CHECK: %[[INT:.*]] = torch.constant.int -1
+// CHECK: %[[TRUE:.*]] = torch.constant.bool true
+// CHECK: %[[T0:.*]] = torch_c.from_builtin_tensor %[[ARG0]] : tensor<1x16x26x26xi1> -> !torch.vtensor<[1,16,26,26],i1>
+// CHECK: %[[T1:.*]] = torch_c.to_builtin_tensor %[[T0]] : !torch.vtensor<[1,16,26,26],i1> -> tensor<1x16x26x26xi1>
+// CHECK: %[[FALSE:.*]] = arith.constant false
+// CHECK: %[[C1:.*]] = arith.constant 1 : index
+// CHECK: %[[C0:.*]] = arith.constant 0 : index
+// CHECK: %[[DIM0:.*]] = tensor.dim %[[T1]], %[[C0]] : tensor<1x16x26x26xi1>
+// CHECK: %[[C1_0:.*]] = arith.constant 1 : index
+// CHECK: %[[DIM1:.*]] = tensor.dim %[[T1]], %[[C1_0]] : tensor<1x16x26x26xi1>
+// CHECK: %[[C2:.*]] = arith.constant 2 : index
+// CHECK: %[[DIM2:.*]] = tensor.dim %[[T1]], %[[C2]] : tensor<1x16x26x26xi1>
+// CHECK: %[[C3:.*]] = arith.constant 3 : index
+// CHECK: %[[DIM3:.*]] = tensor.dim %[[T1]], %[[C3]] : tensor<1x16x26x26xi1>
+// CHECK: %[[EMPTY:.*]] = tensor.empty(%[[DIM0]], %[[DIM1]], %[[DIM2]]) : tensor<?x?x?x1xi1>
+// CHECK: %[[FILL:.*]] = linalg.fill ins(%[[FALSE]] : i1) outs(%[[EMPTY]] : tensor<?x?x?x1xi1>) -> tensor<?x?x?x1xi1>
+// CHECK: %[[GENERIC:.*]] = linalg.generic {indexing_maps = [#[[$MAP]], #[[$MAP1]]], iterator_types = ["parallel", "parallel", "parallel", "reduction"]} ins(%[[T1]] : tensor<1x16x26x26xi1>) outs(%[[FILL]] : tensor<?x?x?x1xi1>) {
+// CHECK: ^bb0(%[[IN:.*]]: i1, %[[OUT:.*]]: i1):
+// CHECK:   %[[ORI:.*]] = arith.ori %[[IN]], %[[OUT]] : i1
+// CHECK:   linalg.yield %[[ORI]] : i1
+// CHECK: } -> tensor<?x?x?x1xi1>
+// CHECK: %[[CAST:.*]] = tensor.cast %[[GENERIC]] : tensor<?x?x?x1xi1> to tensor<1x16x26x1xi1>
+// CHECK: %[[RET:.*]] = torch_c.from_builtin_tensor %[[CAST]] : tensor<1x16x26x1xi1> -> !torch.vtensor<[1,16,26,1],i1>
+// CHECK: return %[[RET]] : !torch.vtensor<[1,16,26,1],i1>
+func.func @torch.ops.aten.anydim$basic(%arg0: tensor<1x16x26x26xi1>) -> !torch.vtensor<[1,16,26,1],i1> {
+  %int-1 = torch.constant.int -1
+  %true = torch.constant.bool true
+  %0 = torch_c.from_builtin_tensor %arg0 : tensor<1x16x26x26xi1> -> !torch.vtensor<[1,16,26,26],i1>
+  %1 = torch.aten.any.dim %0, %int-1, %true : !torch.vtensor<[1,16,26,26],i1>, !torch.int, !torch.bool -> !torch.vtensor<[1,16,26,1],i1>
+  return %1 : !torch.vtensor<[1,16,26,1],i1>
 }
