@@ -157,6 +157,28 @@ func.func @torch.aten.matmul$generic_f16(%arg0: !torch.vtensor<[?,?,8,16],f16>, 
 
 // -----
 
+// Verify that aten.bmm(si8, si8) -> si32 uses i32 accumulator (not i64),
+// enabling downstream i8 HW intrinsics.
+// CHECK-LABEL: func.func @torch.aten.bmm$i8
+// CHECK:      linalg.batch_matmul ins(%{{.*}}, %{{.*}} : tensor<2x8x16xi8>, tensor<2x16x8xi8>) outs(%{{.*}} : tensor<2x8x8xi32>) -> tensor<2x8x8xi32>
+// CHECK-NOT:  arith.extsi
+// CHECK-NOT:  arith.trunci
+func.func @torch.aten.bmm$i8(%arg0: !torch.vtensor<[2,8,16],si8>, %arg1: !torch.vtensor<[2,16,8],si8>) -> !torch.vtensor<[2,8,8],si32> {
+  %0 = torch.aten.bmm %arg0, %arg1 : !torch.vtensor<[2,8,16],si8>, !torch.vtensor<[2,16,8],si8> -> !torch.vtensor<[2,8,8],si32>
+  return %0 : !torch.vtensor<[2,8,8],si32>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.bmm$mixed_si4_f16
+// CHECK:      linalg.batch_matmul ins(%{{.*}}, %{{.*}} : tensor<1x4x8xf16>, tensor<1x8x4xf16>) outs(%{{.*}} : tensor<1x4x4xf32>) -> tensor<1x4x4xf32>
+func.func @torch.aten.bmm$mixed_si4_f16(%arg0: !torch.vtensor<[1,4,8],si4>, %arg1: !torch.vtensor<[1,8,4],f16>) -> !torch.vtensor<[1,4,4],f16> {
+  %0 = torch.aten.bmm %arg0, %arg1 : !torch.vtensor<[1,4,8],si4>, !torch.vtensor<[1,8,4],f16> -> !torch.vtensor<[1,4,4],f16>
+  return %0 : !torch.vtensor<[1,4,4],f16>
+}
+
+// -----
+
 // CHECK-LABEL: func.func @torch.aten.mm$basic_strict(
 // CHECK-NOT: assert
 func.func @torch.aten.mm$basic_strict(%arg0: !torch.vtensor<[?,?],f32>, %arg1: !torch.vtensor<[?,?],f32>) -> !torch.vtensor<[?,2],f32>
@@ -823,4 +845,21 @@ func.func @torch.ops.aten.anydim$basic(%arg0: tensor<1x16x26x26xi1>) -> !torch.v
   %0 = torch_c.from_builtin_tensor %arg0 : tensor<1x16x26x26xi1> -> !torch.vtensor<[1,16,26,26],i1>
   %1 = torch.aten.any.dim %0, %int-1, %true : !torch.vtensor<[1,16,26,26],i1>, !torch.int, !torch.bool -> !torch.vtensor<[1,16,26,1],i1>
   return %1 : !torch.vtensor<[1,16,26,1],i1>
+}
+
+// -----
+
+// Per PyTorch docs, torch.cat allows "a 1-D empty tensor with size (0,)"
+// alongside operands of any rank. The linalg lowering must skip these.
+// CHECK-LABEL: func.func @torch.aten.cat$rank1_empty
+//  CHECK-SAME:   %[[ARG0:.*]]: !torch.vtensor<[1,8,?,128],f16>, %[[ARG1:.*]]: !torch.vtensor<[0],f16>
+//       CHECK:   %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[1,8,?,128],f16> -> tensor<1x8x?x128xf16>
+//       CHECK:   %[[CONCAT:.*]] = tensor.concat dim(2) %[[T0]] : (tensor<1x8x?x128xf16>) -> tensor<1x8x?x128xf16>
+//       CHECK:   %[[T1:.*]] = torch_c.from_builtin_tensor %[[CONCAT]] : tensor<1x8x?x128xf16> -> !torch.vtensor<[1,8,?,128],f16>
+//       CHECK:   return %[[T1]]
+func.func @torch.aten.cat$rank1_empty(%arg0: !torch.vtensor<[1,8,?,128],f16>, %arg1: !torch.vtensor<[0],f16>) -> !torch.vtensor<[1,8,?,128],f16> {
+  %int-2 = torch.constant.int -2
+  %0 = torch.prim.ListConstruct %arg1, %arg0 : (!torch.vtensor<[0],f16>, !torch.vtensor<[1,8,?,128],f16>) -> !torch.list<vtensor>
+  %1 = torch.aten.cat %0, %int-2 : !torch.list<vtensor>, !torch.int -> !torch.vtensor<[1,8,?,128],f16>
+  return %1 : !torch.vtensor<[1,8,?,128],f16>
 }

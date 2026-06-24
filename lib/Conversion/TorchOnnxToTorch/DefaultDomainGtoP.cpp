@@ -10,6 +10,7 @@
 #include "torch-mlir/Conversion/TorchOnnxToTorch/Patterns.h"
 #include "torch-mlir/Conversion/TorchOnnxToTorch/Utils.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -564,15 +565,72 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
             binder.tensorResultType(resultType))
           return failure();
 
-        // Zero points are optional - use None if not provided
-        Value noneVal = Torch::ConstantNoneOp::create(rewriter, loc);
-        if (failed(binder.tensorOperandAtIndex(lhsZp, 2)))
-          lhsZp = noneVal;
-        if (failed(binder.tensorOperandAtIndex(rhsZp, 3)))
-          rhsZp = noneVal;
+        // Zero points are optional. The fork lowers MatMulInteger to
+        // torch.quantized_matmul, which only supports zero points of rank 0
+        // or 1. For rank >= 2 zero points (e.g. a per-row [M, 1]) — which
+        // quantized_matmul cannot represent — fall back to an explicit
+        // decomposition: cast to si32, subtract the zero points, then matmul.
+        bool hasLhsZp = succeeded(binder.tensorOperandAtIndex(lhsZp, 2));
+        bool hasRhsZp = succeeded(binder.tensorOperandAtIndex(rhsZp, 3));
+        auto isHighRankZp = [](Value zp) -> bool {
+          auto ty = dyn_cast<Torch::ValueTensorType>(zp.getType());
+          return ty && ty.hasSizes() && ty.getSizes().size() > 1;
+        };
 
-        rewriter.replaceOpWithNewOp<Torch::QuantizedMatmulOp>(
-            binder.op, resultType, lhs, rhs, lhsZp, rhsZp);
+        if (!(hasLhsZp && isHighRankZp(lhsZp)) &&
+            !(hasRhsZp && isHighRankZp(rhsZp))) {
+          // Fork fast path: absent or rank 0/1 zero points.
+          Value noneVal = Torch::ConstantNoneOp::create(rewriter, loc);
+          if (!hasLhsZp)
+            lhsZp = noneVal;
+          if (!hasRhsZp)
+            rhsZp = noneVal;
+          rewriter.replaceOpWithNewOp<Torch::QuantizedMatmulOp>(
+              binder.op, resultType, lhs, rhs, lhsZp, rhsZp);
+          return success();
+        }
+
+        // Fallback decomposition for rank >= 2 zero points:
+        // lhs = lhs.to(dtype=si32); rhs = rhs.to(dtype=si32);
+        // lhs = lhs - lhsZp; rhs = rhs - rhsZp; res = matmul(lhs, rhs).
+        if (!hasLhsZp)
+          lhsZp = Torch::ConstantIntOp::create(
+              rewriter, binder.getLoc(), rewriter.getType<Torch::IntType>(),
+              rewriter.getIntegerAttr(rewriter.getIntegerType(64), 0));
+        if (!hasRhsZp)
+          rhsZp = Torch::ConstantIntOp::create(
+              rewriter, binder.getLoc(), rewriter.getType<Torch::IntType>(),
+              rewriter.getIntegerAttr(rewriter.getIntegerType(64), 0));
+
+        // Converting lhs and rhs tensor to `si32` type.
+        lhs = Torch::convertTensorToDtype(
+            rewriter, loc, lhs,
+            mlir::IntegerType::get(binder.op->getContext(), 32,
+                                   mlir::IntegerType::Signed));
+        rhs = Torch::convertTensorToDtype(
+            rewriter, loc, rhs,
+            mlir::IntegerType::get(binder.op->getContext(), 32,
+                                   mlir::IntegerType::Signed));
+
+        // Subtracting the zero_point values from lhs and rhs.
+        Value alpha = Torch::ConstantIntOp::create(
+            rewriter, loc, rewriter.getI64IntegerAttr(1));
+        if (auto lhsZpTy = dyn_cast<Torch::ValueTensorType>(lhsZp.getType()))
+          lhs = Torch::AtenSubTensorOp::create(rewriter, loc, lhs.getType(),
+                                               lhs, lhsZp, alpha);
+        else
+          lhs = Torch::AtenSubScalarOp::create(rewriter, loc, lhs.getType(),
+                                               lhs, lhsZp, alpha);
+
+        if (auto rhsZpTy = dyn_cast<Torch::ValueTensorType>(rhsZp.getType()))
+          rhs = Torch::AtenSubTensorOp::create(rewriter, loc, rhs.getType(),
+                                               rhs, rhsZp, alpha);
+        else
+          rhs = Torch::AtenSubScalarOp::create(rewriter, loc, rhs.getType(),
+                                               rhs, rhsZp, alpha);
+
+        rewriter.replaceOpWithNewOp<Torch::AtenMatmulOp>(binder.op, resultType,
+                                                         lhs, rhs);
         return success();
       });
   patterns.onOp("Mul", 7,
@@ -703,7 +761,7 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
         Value oneFltConst =
             Torch::ConstantFloatOp::create(b, rewriter.getF64FloatAttr(1));
         Value LnToLog10Const = Torch::ConstantFloatOp::create(
-            b, rewriter.getF64FloatAttr(M_LOG10E));
+            b, rewriter.getF64FloatAttr(llvm::numbers::log10e));
 
         Value lfDiv7Hfloat =
             Torch::AtenDivFloatOp::create(b, lowerEdgeHzItem, sevenHConst);
