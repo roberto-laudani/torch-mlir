@@ -565,11 +565,11 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
             binder.tensorResultType(resultType))
           return failure();
 
-        // Zero points are optional. The fork lowers MatMulInteger to
-        // torch.quantized_matmul, which only supports zero points of rank 0
-        // or 1. For rank >= 2 zero points (e.g. a per-row [M, 1]) — which
-        // quantized_matmul cannot represent — fall back to an explicit
-        // decomposition: cast to si32, subtract the zero points, then matmul.
+        // Zero points are optional. Lower MatMulInteger to torch.quantized_matmul (#24),
+        // which only supports zero points of rank 0 or 1. For rank >= 2 zero
+        // points (e.g. a per-row [M, 1]) — which quantized_matmul cannot
+        // represent — fall back to an explicit decomposition: cast to si32,
+        // subtract the zero points, then matmul.
         bool hasLhsZp = succeeded(binder.tensorOperandAtIndex(lhsZp, 2));
         bool hasRhsZp = succeeded(binder.tensorOperandAtIndex(rhsZp, 3));
         auto isHighRankZp = [](Value zp) -> bool {

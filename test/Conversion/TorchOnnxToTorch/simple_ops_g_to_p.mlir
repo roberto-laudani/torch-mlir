@@ -583,7 +583,7 @@ func.func @test_matmulinteger_batched(%arg0: !torch.vtensor<[7,4,3],ui8>, %arg1:
 // -----
 
 // Rank-2 (per-row [M,1]) lhs zero point. quantized_matmul only supports zero
-// points of rank 0 or 1, so the fork falls back to the explicit
+// points of rank 0 or 1, so this falls back to the explicit
 // cast/subtract/matmul decomposition for this case.
 // CHECK-LABEL:   func.func @test_matmulinteger_non_scalar_lhsZp(
 func.func @test_matmulinteger_non_scalar_lhsZp(%arg0: !torch.vtensor<[16, 2],ui8>, %arg1: !torch.vtensor<[2,768],si8>,  %arg2: !torch.vtensor<[16,1],ui8>, %arg3: !torch.vtensor<[],si8>) ->  !torch.vtensor<[16,768],si32> attributes {torch.onnx_meta.ir_version = 7 : si64, torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.producer_name = "pytorch", torch.onnx_meta.producer_version = "0.1.0"} {
@@ -599,9 +599,9 @@ func.func @test_matmulinteger_non_scalar_lhsZp(%arg0: !torch.vtensor<[16, 2],ui8
 
 // -----
 
-// Non-scalar (rank-1) rhs zero point with a rank-0 lhs zero point. The fork
-// routes MatMulInteger to torch.quantized_matmul, which carries the zero points
-// directly (rank 0 or 1 supported).
+// Non-scalar (rank-1) rhs zero point with a rank-0 lhs zero point. MatMulInteger
+// is routed to torch.quantized_matmul, which carries the zero points directly
+// (rank 0 or 1 supported).
 // CHECK-LABEL:   func.func @test_matmulinteger_non_scalar_rhsZp(
 func.func @test_matmulinteger_non_scalar_rhsZp(%arg0: !torch.vtensor<[?,?],ui8>, %arg1: !torch.vtensor<[2,768],si8>,  %arg2: !torch.vtensor<[],ui8>, %arg3: !torch.vtensor<[768],si8>) ->  !torch.vtensor<[?,768],si32> attributes {torch.onnx_meta.ir_version = 7 : si64, torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.producer_name = "pytorch", torch.onnx_meta.producer_version = "0.1.0"} {
   // CHECK: torch.quantized_matmul %arg0, %arg1, %arg2, %arg3 : !torch.vtensor<[?,?],ui8>, !torch.vtensor<[2,768],si8>, !torch.vtensor<[],ui8>, !torch.vtensor<[768],si8> -> !torch.vtensor<[?,768],si32>
@@ -611,9 +611,8 @@ func.func @test_matmulinteger_non_scalar_rhsZp(%arg0: !torch.vtensor<[?,?],ui8>,
 
 // -----
 
-// No zero points (symmetric quantization). The fork lowers to
-// torch.quantized_matmul with None zero points (assumed 0); upstream instead
-// emits a plain aten.matmul on the native dtypes.
+// No zero points (symmetric quantization): lowered to torch.quantized_matmul
+// with None zero points (assumed 0).
 // CHECK-LABEL: @test_matmulinteger_no_zero_points
 func.func @test_matmulinteger_no_zero_points(%arg0: !torch.vtensor<[4,3],si8>, %arg1: !torch.vtensor<[3,2],si8>) -> !torch.vtensor<[4,2],si32> attributes {torch.onnx_meta.ir_version = 5 : si64, torch.onnx_meta.opset_version = 10 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
   // CHECK: %[[NONE:.+]] = torch.constant.none

@@ -7923,9 +7923,8 @@ class DecomposeAtenInstanceNormOp
     Value inputSubMeanSquare = AtenMulTensorOp::create(
         rewriter, loc, inputAccTy, inputSubMean, inputSubMean);
 
-    // Combine: use the fork's AtenMeanDimOp (runtime divisor — correct for
-    // dynamic spatial dims, unlike upstream's compile-time elemCount) emitting
-    // into upstream's accumulation dtype (reducedAccTy) for precision.
+    // Use AtenMeanDimOp (runtime divisor — correct for dynamic spatial dims)
+    // emitting into the accumulation dtype (reducedAccTy) for precision.
     // var(x) = mean((x - mean(x))^2)
     Value inputVar = AtenMeanDimOp::create(
         rewriter, loc, reducedAccTy, inputSubMeanSquare, reduceDimList, cstTrue,
