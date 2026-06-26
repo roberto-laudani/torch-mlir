@@ -11,8 +11,10 @@
 
 #include "PopulatePatterns.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
 #include "torch-mlir/Conversion/TorchToLinalg/Utils.h"
 #include "torch-mlir/Conversion/Utils/Utils.h"
@@ -20,7 +22,9 @@
 #include "torch-mlir/Dialect/Torch/Utils/TorchUpstream.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
 
+#include <algorithm>
 #include <numeric>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -94,6 +98,35 @@ static Value replicationPad(ConversionPatternRewriter &rewriter, Location loc,
   return res;
 }
 
+// Converts one torch padding amount to an index-typed OpFoldResult: a constant
+// stays a static index attr; a dynamic value is materialized and index-cast.
+// Flags maybeNegative for a negative constant or any dynamic value.
+static OpFoldResult toIndexPad(ConversionPatternRewriter &rewriter,
+                               Location loc, const TypeConverter *tc, Value v,
+                               bool &maybeNegative) {
+  int64_t amount;
+  if (matchPattern(v, m_TorchConstantInt(&amount))) {
+    maybeNegative |= amount < 0;
+    return rewriter.getIndexAttr(amount);
+  }
+  maybeNegative = true;
+  Type cty = tc->convertType(v.getType());
+  v = tc->materializeTargetConversion(rewriter, loc, cty, v);
+  return getAsOpFoldResult(
+      arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), v));
+}
+
+// Returns {crop, pad} for one side: crop = max(-amount, 0),
+// pad = max(amount, 0).
+static std::pair<Value, Value>
+getCropAndPadAmounts(ConversionPatternRewriter &rewriter, Location loc,
+                     Value c0, Value amount) {
+  Value neg = arith::SubIOp::create(rewriter, loc, c0, amount);
+  Value crop = arith::MaxSIOp::create(rewriter, loc, neg, c0);
+  Value pad = arith::MaxSIOp::create(rewriter, loc, amount, c0);
+  return {crop, pad};
+}
+
 namespace {
 class ConvertAtenConstantPadNdOp
     : public OpConversionPattern<AtenConstantPadNdOp> {
@@ -125,42 +158,24 @@ public:
     // Initialize low/high paddings with the dims that should not be padded.
     int64_t noPad = rank - padRank;
     Attribute zero = rewriter.getIndexAttr(0);
-    SmallVector<int64_t> staticLow(noPad, 0);
-    SmallVector<int64_t> staticHigh(noPad, 0);
     SmallVector<OpFoldResult> lowPad(noPad, zero);
     SmallVector<OpFoldResult> highPad(noPad, zero);
+
+    // Whether any padding amount may be negative -- either a statically known
+    // negative constant or a runtime value whose sign is unknown. A negative
+    // pad amount crops in torch semantics, which tensor.pad cannot express, so
+    // such cases take the crop-then-pad path below instead of the fast path.
+    bool maybeNegative = false;
 
     auto tc = getTypeConverter();
 
     // Add the requested padding - note op.pad() is highest dim first ordered
     // pairs of low,high.
     for (uint64_t i = padRank; i > 0; --i) {
-      int64_t lowi, highi;
-      Value lowv = padVals[i * 2 - 2];
-      Value highv = padVals[i * 2 - 1];
-      if (!matchPattern(lowv, m_TorchConstantInt(&lowi))) {
-        Type cty = tc->convertType(lowv.getType());
-        lowv = tc->materializeTargetConversion(rewriter, loc, cty, lowv);
-        lowv = arith::IndexCastOp::create(rewriter, loc,
-                                          rewriter.getIndexType(), lowv);
-        lowPad.push_back(lowv);
-        staticLow.push_back(ShapedType::kDynamic);
-      } else {
-        lowPad.push_back(rewriter.getIndexAttr(lowi));
-        staticLow.push_back(lowi);
-      }
-
-      if (!matchPattern(highv, m_TorchConstantInt(&highi))) {
-        Type cty = tc->convertType(highv.getType());
-        highv = tc->materializeTargetConversion(rewriter, loc, cty, highv);
-        highv = arith::IndexCastOp::create(rewriter, loc,
-                                           rewriter.getIndexType(), highv);
-        highPad.push_back(highv);
-        staticHigh.push_back(ShapedType::kDynamic);
-      } else {
-        highPad.push_back(rewriter.getIndexAttr(highi));
-        staticHigh.push_back(highi);
-      }
+      lowPad.push_back(
+          toIndexPad(rewriter, loc, tc, padVals[i * 2 - 2], maybeNegative));
+      highPad.push_back(
+          toIndexPad(rewriter, loc, tc, padVals[i * 2 - 1], maybeNegative));
     }
 
     Type newResultType = getTypeConverter()->convertType(op.getType());
@@ -172,10 +187,60 @@ public:
         convertScalarToDtype(rewriter, loc, adaptor.getValue(), elementType,
                              std::nullopt, dstOriginalDtype);
 
-    Type padType = tensor::PadOp::inferResultType(
-        cast<RankedTensorType>(self.getType()), staticLow, staticHigh);
-    Value paddedInput = tensor::PadOp::create(rewriter, loc, padType, self,
-                                              lowPad, highPad, castedValue);
+    // Fast path: every padding amount is a statically known, non-negative
+    // constant, so a single tensor.pad realizes the result directly.
+    if (!maybeNegative) {
+      SmallVector<int64_t> staticLow, staticHigh;
+      SmallVector<Value> dynLow, dynHigh;
+      dispatchIndexOpFoldResults(lowPad, dynLow, staticLow);
+      dispatchIndexOpFoldResults(highPad, dynHigh, staticHigh);
+      Type padType = tensor::PadOp::inferResultType(
+          cast<RankedTensorType>(self.getType()), staticLow, staticHigh);
+      Value paddedInput = tensor::PadOp::create(rewriter, loc, padType, self,
+                                                lowPad, highPad, castedValue);
+      rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType,
+                                                  paddedInput);
+      return success();
+    }
+
+    // General path: a padding amount may be negative (statically, or at
+    // runtime when it is a dynamic value). In torch semantics a negative amount
+    // crops |amount| elements from that side, but tensor.pad only accepts
+    // non-negative amounts. Split each amount into crop = max(-amount, 0) and
+    // pad = max(amount, 0), crop with tensor.extract_slice, then tensor.pad the
+    // remainder. Extents are left dynamic; canonicalization folds the constant
+    // arithmetic, recovers the static shape, and drops the slice/pad when
+    // nothing is cropped/padded.
+    Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
+
+    SmallVector<OpFoldResult> sliceOffsets(rank), sliceSizes(rank);
+    SmallVector<OpFoldResult> sliceStrides(rank, rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> newLow(rank), newHigh(rank);
+    for (int64_t d = 0; d < rank; ++d) {
+      Value lowVal = getValueOrCreateConstantIndexOp(rewriter, loc, lowPad[d]);
+      Value highVal =
+          getValueOrCreateConstantIndexOp(rewriter, loc, highPad[d]);
+      auto [cropFront, padFront] =
+          getCropAndPadAmounts(rewriter, loc, c0, lowVal);
+      auto [cropBack, padBack] =
+          getCropAndPadAmounts(rewriter, loc, c0, highVal);
+      Value origDim = getValueOrCreateConstantIndexOp(
+          rewriter, loc, tensor::getMixedSize(rewriter, loc, self, d));
+      // Sliced size on this dim: origDim - cropFront - cropBack.
+      Value size = arith::SubIOp::create(rewriter, loc, origDim, cropFront);
+      size = arith::SubIOp::create(rewriter, loc, size, cropBack);
+      sliceOffsets[d] = cropFront;
+      sliceSizes[d] = size;
+      newLow[d] = padFront;
+      newHigh[d] = padBack;
+    }
+
+    Value cropped = tensor::ExtractSliceOp::create(
+        rewriter, loc, self, sliceOffsets, sliceSizes, sliceStrides);
+    Type padType = RankedTensorType::get(
+        SmallVector<int64_t>(rank, ShapedType::kDynamic), elementType);
+    Value paddedInput = tensor::PadOp::create(rewriter, loc, padType, cropped,
+                                              newLow, newHigh, castedValue);
     rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, paddedInput);
     return success();
   }
