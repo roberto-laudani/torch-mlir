@@ -21,7 +21,9 @@ from lit.llvm.subst import FindTool
 # name: The name of this test suite.
 config.name = "TORCH_MLIR"
 
-config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
+config.test_format = lit.formats.ShTest(
+    not llvm_config.use_lit_shell, force_execute_external=not llvm_config.use_lit_shell
+)
 
 # suffixes: A list of file extensions to treat as test files.
 config.suffixes = [".mlir", ".py", ".runlit"]
