@@ -765,34 +765,182 @@ static Value createLinalgPayloadCalculationForElementwiseOp(
       geluBackward.emitError("unimplemented: non-floating point dtype");
       return nullptr;
     }
-    // TODO: Take approximation into account.
     std::string approximate;
     if (!matchPattern(geluBackward.getApproximate(),
-                      m_TorchConstantStr(approximate)) ||
-        approximate != "none")
+                      m_TorchConstantStr(approximate))) {
+      geluBackward.emitError(
+          "unimplemented: expected approximate to be a constant str");
       return nullptr;
+    }
     Type elementType = payloadArgs[1].getType();
-    Value cstAlpha0 = arith::ConstantOp::create(
-        b, loc, FloatAttr::get(elementType, 1.12837916709551257390));
-    Value cstAlpha1 = arith::ConstantOp::create(
-        b, loc, FloatAttr::get(elementType, 0.70710678118654752440));
-    Value oneHalf =
-        arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 0.5));
-    Value kAlpha = arith::MulFOp::create(b, loc, cstAlpha0, cstAlpha1);
-    Value kAlphaHalf = arith::MulFOp::create(b, loc, kAlpha, oneHalf);
-    Value negOneHalf =
-        arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, -0.5));
-    Value inputSquared =
-        arith::MulFOp::create(b, loc, payloadArgs[1], payloadArgs[1]);
-    Value negHalfInputSquared =
-        arith::MulFOp::create(b, loc, inputSquared, negOneHalf);
-    Value dinput = math::ExpOp::create(b, loc, negHalfInputSquared);
-    Value cdf = buildUnitNormalCdf(b, loc, payloadArgs[1]);
-    Value dinputInput = arith::MulFOp::create(b, loc, dinput, payloadArgs[1]);
-    Value dinputInputAlpha =
-        arith::MulFOp::create(b, loc, dinputInput, kAlphaHalf);
-    Value cdfExt = arith::AddFOp::create(b, loc, dinputInputAlpha, cdf);
-    return arith::MulFOp::create(b, loc, payloadArgs[0], cdfExt);
+    if (approximate == "none") {
+      Value cstAlpha0 = arith::ConstantOp::create(
+          b, loc, FloatAttr::get(elementType, 1.12837916709551257390));
+      Value cstAlpha1 = arith::ConstantOp::create(
+          b, loc, FloatAttr::get(elementType, 0.70710678118654752440));
+      Value oneHalf =
+          arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 0.5));
+      Value kAlpha = arith::MulFOp::create(b, loc, cstAlpha0, cstAlpha1);
+      Value kAlphaHalf = arith::MulFOp::create(b, loc, kAlpha, oneHalf);
+      Value negOneHalf =
+          arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, -0.5));
+      Value inputSquared =
+          arith::MulFOp::create(b, loc, payloadArgs[1], payloadArgs[1]);
+      Value negHalfInputSquared =
+          arith::MulFOp::create(b, loc, inputSquared, negOneHalf);
+      Value dinput = math::ExpOp::create(b, loc, negHalfInputSquared);
+      Value cdf = buildUnitNormalCdf(b, loc, payloadArgs[1]);
+      Value dinputInput = arith::MulFOp::create(b, loc, dinput, payloadArgs[1]);
+      Value dinputInputAlpha =
+          arith::MulFOp::create(b, loc, dinputInput, kAlphaHalf);
+      Value cdfExt = arith::AddFOp::create(b, loc, dinputInputAlpha, cdf);
+      return arith::MulFOp::create(b, loc, payloadArgs[0], cdfExt);
+    }
+    if (approximate == "tanh") {
+      // GELU(x) = 0.5 * x * (1 + tanh(kBeta * (x + kKappa * x^3)))
+      // Let u = kBeta * (x + kKappa * x^3); then
+      // dGELU/dx = 0.5 * (1 + tanh(u))
+      //          + 0.5 * x * (1 - tanh(u)^2) * kBeta * (1 + 3 * kKappa * x^2)
+      Value self = payloadArgs[1];
+      Value cstBeta = arith::ConstantOp::create(
+          b, loc, FloatAttr::get(elementType, 0.7977240352174656));
+      Value cstKappa = arith::ConstantOp::create(
+          b, loc, FloatAttr::get(elementType, 0.044715));
+      Value cstOne =
+          arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 1.0));
+      Value cstThree =
+          arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 3.0));
+      Value cstHalf =
+          arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 0.5));
+      Value xSquared = arith::MulFOp::create(b, loc, self, self);
+      Value xCubed = arith::MulFOp::create(b, loc, xSquared, self);
+      Value kappaXCubed = arith::MulFOp::create(b, loc, cstKappa, xCubed);
+      Value xPlusKappaXCubed = arith::AddFOp::create(b, loc, self, kappaXCubed);
+      Value inner = arith::MulFOp::create(b, loc, cstBeta, xPlusKappaXCubed);
+      Value tanhInner = math::TanhOp::create(b, loc, inner);
+      Value onePlusTanh = arith::AddFOp::create(b, loc, cstOne, tanhInner);
+      Value leftDerivative =
+          arith::MulFOp::create(b, loc, cstHalf, onePlusTanh);
+      Value tanhSquared = arith::MulFOp::create(b, loc, tanhInner, tanhInner);
+      Value oneMinusTanhSquared =
+          arith::SubFOp::create(b, loc, cstOne, tanhSquared);
+      Value threeKappa = arith::MulFOp::create(b, loc, cstThree, cstKappa);
+      Value threeKappaXSquared =
+          arith::MulFOp::create(b, loc, threeKappa, xSquared);
+      Value innerDerivativeFactor =
+          arith::AddFOp::create(b, loc, cstOne, threeKappaXSquared);
+      Value innerDerivative =
+          arith::MulFOp::create(b, loc, cstBeta, innerDerivativeFactor);
+      Value halfX = arith::MulFOp::create(b, loc, cstHalf, self);
+      Value halfXOneMinusTanhSquared =
+          arith::MulFOp::create(b, loc, halfX, oneMinusTanhSquared);
+      Value rightDerivative = arith::MulFOp::create(
+          b, loc, halfXOneMinusTanhSquared, innerDerivative);
+      Value derivative =
+          arith::AddFOp::create(b, loc, leftDerivative, rightDerivative);
+      return arith::MulFOp::create(b, loc, payloadArgs[0], derivative);
+    }
+    geluBackward.emitError(
+        "unimplemented: approximate value should be none or tanh");
+    return nullptr;
+  }
+  if (auto eluBackward = dyn_cast<AtenEluBackwardOp>(op)) {
+    AtenEluBackwardOp::Adaptor adaptor(operands);
+    if (!isa<mlir::FloatType>(
+            cast<ValueTensorType>(eluBackward.getType()).getDtype())) {
+      eluBackward.emitError("unimplemented: non-floating point dtype");
+      return nullptr;
+    }
+    bool isResult;
+    if (!matchPattern(eluBackward.getIsResult(),
+                      m_TorchConstantBool(&isResult))) {
+      eluBackward.emitError(
+          "unimplemented: expected is_result to be a constant bool");
+      return nullptr;
+    }
+    Value gradOutput = payloadArgs[0];
+    Type elementType = gradOutput.getType();
+    Value selfOrResult =
+        convertScalarToDtype(b, loc, payloadArgs[1], elementType);
+    Value alpha = convertScalarToDtype(b, loc, adaptor.getAlpha(), elementType);
+    Value scale = convertScalarToDtype(b, loc, adaptor.getScale(), elementType);
+    Value inputScale =
+        convertScalarToDtype(b, loc, adaptor.getInputScale(), elementType);
+    Value zero =
+        arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 0.0));
+    // dELU/dx = scale, when self_or_result > 0
+    // dELU/dx = input_scale * (y + alpha * scale), when y <= 0 and is_result
+    // dELU/dx = scale * alpha * input_scale * exp(input_scale * x),
+    //   when x <= 0 and !is_result
+    Value posGrad = arith::MulFOp::create(b, loc, gradOutput, scale);
+    Value negGrad;
+    if (isResult) {
+      Value alphaScale = arith::MulFOp::create(b, loc, alpha, scale);
+      Value yPlusAlphaScale =
+          arith::AddFOp::create(b, loc, selfOrResult, alphaScale);
+      Value scaledY =
+          arith::MulFOp::create(b, loc, inputScale, yPlusAlphaScale);
+      negGrad = arith::MulFOp::create(b, loc, gradOutput, scaledY);
+    } else {
+      Value xInputScale =
+          arith::MulFOp::create(b, loc, selfOrResult, inputScale);
+      Value expXInputScale = math::ExpOp::create(b, loc, xInputScale);
+      Value scaleAlpha = arith::MulFOp::create(b, loc, scale, alpha);
+      Value scaleAlphaInputScale =
+          arith::MulFOp::create(b, loc, scaleAlpha, inputScale);
+      Value derivative =
+          arith::MulFOp::create(b, loc, scaleAlphaInputScale, expXInputScale);
+      negGrad = arith::MulFOp::create(b, loc, gradOutput, derivative);
+    }
+    // PyTorch branches on `self_or_result <= 0`, which is false for NaN, so
+    // NaN takes the positive branch. UGT (unordered-or-greater) is the dual:
+    // true for NaN or > 0, picking posGrad — matching PyTorch.
+    Value pred = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::UGT,
+                                       selfOrResult, zero);
+    return arith::SelectOp::create(b, loc, pred, posGrad, negGrad);
+  }
+  if (isa<AtenSigmoidBackwardOp>(op)) {
+    if (!isa<mlir::FloatType>(
+            cast<ValueTensorType>(op->getResult(0).getType()).getDtype())) {
+      op->emitError("unimplemented: non-floating point dtype");
+      return nullptr;
+    }
+    Value gradOutput = payloadArgs[0];
+    Type elementType = gradOutput.getType();
+    Value output = convertScalarToDtype(b, loc, payloadArgs[1], elementType);
+    Value one =
+        arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 1.0));
+    // dSigmoid/dx evaluated from output y = sigmoid(x): y * (1 - y)
+    Value oneMinusOutput = arith::SubFOp::create(b, loc, one, output);
+    Value derivative = arith::MulFOp::create(b, loc, output, oneMinusOutput);
+    return arith::MulFOp::create(b, loc, gradOutput, derivative);
+  }
+  if (auto softplusBackward = dyn_cast<AtenSoftplusBackwardOp>(op)) {
+    AtenSoftplusBackwardOp::Adaptor adaptor(operands);
+    if (!isa<mlir::FloatType>(
+            cast<ValueTensorType>(softplusBackward.getType()).getDtype())) {
+      softplusBackward.emitError("unimplemented: non-floating point dtype");
+      return nullptr;
+    }
+    Value gradOutput = payloadArgs[0];
+    Type elementType = gradOutput.getType();
+    Value self = convertScalarToDtype(b, loc, payloadArgs[1], elementType);
+    Value beta = convertScalarToDtype(b, loc, adaptor.getBeta(), elementType);
+    Value threshold =
+        convertScalarToDtype(b, loc, adaptor.getThreshold(), elementType);
+    Value one =
+        arith::ConstantOp::create(b, loc, FloatAttr::get(elementType, 1.0));
+    // dSoftplus/dx = exp(beta*x) / (1 + exp(beta*x))
+    // when beta*x > threshold, the forward op is approximated by the identity
+    // so the derivative becomes 1.
+    Value betaX = arith::MulFOp::create(b, loc, beta, self);
+    Value expBetaX = math::ExpOp::create(b, loc, betaX);
+    Value denom = arith::AddFOp::create(b, loc, expBetaX, one);
+    Value derivative = arith::DivFOp::create(b, loc, expBetaX, denom);
+    Value scaledGrad = arith::MulFOp::create(b, loc, gradOutput, derivative);
+    Value pred = arith::CmpFOp::create(b, loc, arith::CmpFPredicate::UGT, betaX,
+                                       threshold);
+    return arith::SelectOp::create(b, loc, pred, gradOutput, scaledGrad);
   }
   if (auto hardtanhBackward = dyn_cast<AtenHardtanhBackwardOp>(op)) {
     AtenHardtanhBackwardOp::Adaptor adaptor(operands);
@@ -1618,7 +1766,8 @@ public:
   matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
     if (!isa<AtenTanOp, AtenTanhOp, AtenSinhOp, AtenCoshOp, AtenReluOp,
-             AtenPreluOp, AtenGeluOp, AtenGeluBackwardOp, AtenAddTensorOp,
+             AtenPreluOp, AtenGeluOp, AtenGeluBackwardOp, AtenEluBackwardOp,
+             AtenSigmoidBackwardOp, AtenSoftplusBackwardOp, AtenAddTensorOp,
              AtenMulTensorOp, AtenDivTensorOp, AtenDivTensorModeOp,
              AtenDivScalarModeOp, AtenSubTensorOp, AtenAtan2Op,
              AtenLerpTensorOp, AtenSigmoidOp, AtenExpOp, AtenExpm1Op,
@@ -1852,143 +2001,6 @@ public:
         convertScalarToDtype(rewriter, loc, totalWeightVal, elementType));
 
     rewriter.replaceOp(op, {finalRes, totalWeight});
-    return success();
-  }
-};
-} // namespace
-
-/// Inverted STD: rSTD = 1 / sqrt(var + eps).
-static Value calculateRSTD(OpBuilder &b, Location loc, Type elemTy, Value eps,
-                           Value var) {
-  // The eps is always f64.
-  Value truncatedEps = arith::TruncFOp::create(b, loc, elemTy, eps);
-  Value varPlusEps = arith::AddFOp::create(b, loc, var, truncatedEps);
-  Value rSTD = math::RsqrtOp::create(b, loc, varPlusEps);
-  return rSTD;
-}
-
-// Normalization formula:
-//   ((input - mean) * rSTD * weight + bias
-static Value createLinalgPayloadCalculationForNormOpsWithRSTD(
-    OpBuilder &b, Location loc, Type elemTy, Value input, Value mean,
-    Value rSTD, Value eps, Value weight, Value bias) {
-  Value inputSubMean = arith::SubFOp::create(b, loc, input, mean);
-  Value temp = arith::MulFOp::create(b, loc, inputSubMean, rSTD);
-  Value timesWeight = arith::MulFOp::create(b, loc, temp, weight);
-  Value plusBias = arith::AddFOp::create(b, loc, timesWeight, bias);
-  return plusBias;
-}
-
-static Value createLinalgPayloadCalculationForNormOpsWithVar(
-    OpBuilder &b, Location loc, Type elemTy, Value input, Value mean, Value var,
-    Value eps, Value weight, Value bias) {
-  Value rSTD = calculateRSTD(b, loc, elemTy, eps, var);
-  Value result = createLinalgPayloadCalculationForNormOpsWithRSTD(
-      b, loc, elemTy, input, mean, rSTD, eps, weight, bias);
-  return result;
-}
-
-namespace {
-class ConvertAtenBatchNormOp : public OpConversionPattern<AtenBatchNormOp> {
-public:
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(AtenBatchNormOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    MLIRContext *context = op->getContext();
-    Location loc = op->getLoc();
-    Value input = adaptor.getInput();
-    Value weight = adaptor.getWeight();
-    Value bias = adaptor.getBias();
-    Value runningMean = adaptor.getRunningMean();
-    Value runningVar = adaptor.getRunningVar();
-    Value training = adaptor.getTraining();
-    Value eps = adaptor.getEps();
-
-    if (failed(verifyLinalgCompatibleTypes(op, rewriter)))
-      return failure();
-
-    // TODO: Handle the None cases for the optional parameters:
-    // weight, bias.
-    if (failed(checkNotNone(rewriter, op, weight)) ||
-        failed(checkNotNone(rewriter, op, bias)) ||
-        failed(checkNotNone(rewriter, op, runningMean)) ||
-        failed(checkNotNone(rewriter, op, runningVar)))
-      return failure();
-
-    auto inputType = cast<RankedTensorType>(input.getType());
-    auto weightType = cast<RankedTensorType>(weight.getType());
-    auto biasType = cast<RankedTensorType>(bias.getType());
-    auto runningMeanType = cast<RankedTensorType>(runningMean.getType());
-    auto runningVarType = cast<RankedTensorType>(runningVar.getType());
-
-    auto inputRank = inputType.getRank();
-    if (inputRank < 2)
-      return rewriter.notifyMatchFailure(
-          op, "input should have rank larger than 1");
-
-    if (weightType.getRank() != 1 || biasType.getRank() != 1 ||
-        runningMeanType.getRank() != 1 || runningVarType.getRank() != 1) {
-      return rewriter.notifyMatchFailure(
-          op, "expect weight, bias, running_mean and running_var to be rank 1");
-    }
-
-    // TODO: Add support for training.
-    auto constFalse = arith::ConstantOp::create(
-        rewriter, loc, IntegerAttr::get(IntegerType::get(context, 1), 0));
-    auto trainingFalse = arith::CmpIOp::create(
-        rewriter, loc, arith::CmpIPredicate::eq, training, constFalse);
-    cf::AssertOp::create(
-        rewriter, loc, trainingFalse,
-        rewriter.getStringAttr("training is not supported for now"));
-
-    // num_features – C from an expected input of size (N,C,D,H,W ...)
-    Value numFeatures = tensor::DimOp::create(rewriter, loc, input, 1);
-    auto contractingDim0EqualsNumFeatures = [&](Value v) {
-      auto dim0 = tensor::DimOp::create(rewriter, loc, v, 0);
-      auto dim0Equal = arith::CmpIOp::create(
-          rewriter, loc, arith::CmpIPredicate::eq, numFeatures, dim0);
-      cf::AssertOp::create(
-          rewriter, loc, dim0Equal,
-          rewriter.getStringAttr(
-              "expect the size of dim 0 equal to the number of features"));
-    };
-    if (!isAssumingStrictSymbolicShapes(rewriter)) {
-      contractingDim0EqualsNumFeatures(weight);
-      contractingDim0EqualsNumFeatures(bias);
-      contractingDim0EqualsNumFeatures(runningMean);
-      contractingDim0EqualsNumFeatures(runningVar);
-    }
-
-    auto indexingMap = AffineMap::get(
-        /*dimCount=*/inputRank,
-        /*symbolCount=*/0, rewriter.getAffineDimExpr(1), context);
-    SmallVector<AffineMap> indexingMaps = {
-        rewriter.getMultiDimIdentityMap(inputRank), // input
-        indexingMap,                                // weight
-        indexingMap,                                // bias
-        indexingMap,                                // runningMean
-        indexingMap,                                // runningVar
-        rewriter.getMultiDimIdentityMap(inputRank), // output
-    };
-    SmallVector<utils::IteratorType> iteratorTypes(
-        inputRank, utils::IteratorType::parallel);
-    Value batchNorm =
-        linalg::GenericOp::create(
-            rewriter, loc, input.getType(),
-            ValueRange{input, weight, bias, runningMean, runningVar}, input,
-            /*indexingMaps=*/indexingMaps,
-            /*iteratorTypes=*/iteratorTypes,
-            [&](OpBuilder &b, Location loc, ValueRange args) {
-              Value input = args[0], weight = args[1], bias = args[2],
-                    mean = args[3], var = args[4];
-              Value result = createLinalgPayloadCalculationForNormOpsWithVar(
-                  b, loc, var.getType(), input, mean, var, eps, weight, bias);
-              linalg::YieldOp::create(b, loc, result);
-            })
-            .getResult(0);
-    Type newResultType = getTypeConverter()->convertType(op.getType());
-    rewriter.replaceOpWithNewOp<tensor::CastOp>(op, newResultType, batchNorm);
     return success();
   }
 };
@@ -4058,6 +4070,7 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
   target.addIllegalOp<
       AtenTanOp, AtenTanhOp, AtenSinhOp, AtenCoshOp, AtenAtanhOp, AtenAcoshOp,
       AtenAsinOp, AtenAsinhOp, AtenReluOp, AtenGeluOp, AtenGeluBackwardOp,
+      AtenEluBackwardOp, AtenSigmoidBackwardOp, AtenSoftplusBackwardOp,
       AtenAddTensorOp, AtenMulTensorOp, AtenDivTensorOp, AtenDivTensorModeOp,
       AtenDivScalarModeOp, AtenSubTensorOp, AtenLerpTensorOp, AtenSigmoidOp,
       AtenMinimumOp, AtenAtan2Op, AtenMaximumOp, AtenToDtypeOp, AtenClampOp,
@@ -4084,8 +4097,6 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
   patterns.add<ConvertAtenDetachOp>(typeConverter, context);
   target.addIllegalOp<AtenDetachOp>();
   patterns.add<ConvertAtenNllLossForwardOp>(typeConverter, context);
-  target.addIllegalOp<AtenBatchNormOp>();
-  patterns.add<ConvertAtenBatchNormOp>(typeConverter, context);
   target.addIllegalOp<AtenLogitOp>();
   patterns.add<ConvertLogitOp>(typeConverter, context);
   target.addIllegalOp<PrimsCollapseOp>();
