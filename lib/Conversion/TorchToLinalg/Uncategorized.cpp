@@ -383,17 +383,35 @@ Value createRemainderPayload(OpBuilder &b, Location loc,
 //   round(input/scale) + zeroPoint
 // roundBeforeAdd=false matches quantize_per_token:
 //   round(input/scale + zeroPoint)
+// multiplyByReciprocal=true matches torchao quantize_affine:
+//   input * (1/scale), with 1/scale computed in the scale dtype
+// addType is the type that the zero point is added and the result clamped in;
+// it defaults to the input type.
 static Value createQuantizePayload(OpBuilder &b, Location loc,
                                    const TypeConverter *converter, Value input,
                                    Value scale, Value zeroPoint, Value quantMin,
                                    Value quantMax, Type outputType,
                                    bool outputIsUnsigned, bool roundBeforeAdd,
-                                   Type zeroPointDtype = {}) {
+                                   Type zeroPointDtype = {},
+                                   bool multiplyByReciprocal = false,
+                                   Type addType = {}) {
   Type computeType = input.getType();
+  if (!addType)
+    addType = computeType;
+  if (multiplyByReciprocal) {
+    Value one =
+        arith::ConstantOp::create(b, loc, b.getFloatAttr(scale.getType(), 1.0));
+    scale = arith::DivFOp::create(b, loc, one, scale);
+  }
   scale = materializeScalarToDtype(b, loc, converter, scale, computeType);
-  zeroPoint = materializeScalarToDtype(b, loc, converter, zeroPoint,
-                                       computeType, zeroPointDtype);
-  Value value = arith::DivFOp::create(b, loc, input, scale);
+  zeroPoint = materializeScalarToDtype(b, loc, converter, zeroPoint, addType,
+                                       zeroPointDtype);
+  Value value;
+  if (multiplyByReciprocal)
+    value = arith::MulFOp::create(b, loc, input, scale);
+  else
+    value = arith::DivFOp::create(b, loc, input, scale);
+  value = convertScalarToDtype(b, loc, value, addType);
   if (roundBeforeAdd) {
     value = math::RoundEvenOp::create(b, loc, value);
     value = arith::AddFOp::create(b, loc, value, zeroPoint);
@@ -2728,6 +2746,226 @@ public:
         });
 
     rewriter.replaceOp(op, scaleZpGeneric.getResults());
+    return success();
+  }
+};
+
+static FailureOr<SmallVector<AffineMap>>
+getPerBlockIndexingMaps(OpBuilder &b, ArrayRef<int64_t> inputShape,
+                        ArrayRef<int64_t> blockSize,
+                        ArrayRef<int64_t> scaleShape, bool hasZeroPoint) {
+  SmallVector<AffineExpr> blockIndices;
+  SmallVector<int64_t> numBlocks;
+  for (auto [dim, size, block] : llvm::enumerate(inputShape, blockSize)) {
+    if (size == block)
+      continue;
+    AffineExpr index = b.getAffineDimExpr(dim);
+    blockIndices.push_back(block == 1 ? index : index.floorDiv(block));
+    numBlocks.push_back(ShapedType::isDynamic(size) ? size : size / block);
+  }
+  auto scaleBlocks = llvm::make_filter_range(
+      scaleShape, [](int64_t size) { return size != 1; });
+  if (!llvm::equal(scaleBlocks, numBlocks))
+    return failure();
+
+  SmallVector<AffineExpr> qparamsExprs;
+  auto *blockIndex = blockIndices.begin();
+  for (int64_t size : scaleShape)
+    qparamsExprs.push_back(size == 1 ? b.getAffineConstantExpr(0)
+                                     : *blockIndex++);
+  AffineMap qparamsMap =
+      AffineMap::get(inputShape.size(), 0, qparamsExprs, b.getContext());
+
+  AffineMap inputMap = b.getMultiDimIdentityMap(inputShape.size());
+  SmallVector<AffineMap> indexingMaps = {inputMap, qparamsMap};
+  if (hasZeroPoint)
+    indexingMaps.push_back(qparamsMap);
+  indexingMaps.push_back(inputMap);
+  return indexingMaps;
+}
+
+// Asserts what torchao's view checks and dynamic sizes hide: a blocked input
+// dimension is divisible by its block, and scale and zero point have one entry
+// per block. `qparamsMap` maps each scale dimension to `d`, `d floordiv block`
+// or 0.
+static void assertPerBlockShapes(OpBuilder &b, Location loc, Value input,
+                                 Value scale, Value zeroPoint,
+                                 AffineMap qparamsMap) {
+  auto assertEqual = [&](Value lhs, Value rhs, StringRef message) {
+    Value equal =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq, lhs, rhs);
+    cf::AssertOp::create(b, loc, equal, b.getStringAttr(message));
+  };
+  auto scaleType = cast<RankedTensorType>(scale.getType());
+  for (auto [scaleDim, expr] : llvm::enumerate(qparamsMap.getResults())) {
+    if (!scaleType.isDynamicDim(scaleDim))
+      continue;
+    auto floorDiv = dyn_cast<AffineBinaryOpExpr>(expr);
+    int64_t inputDim =
+        cast<AffineDimExpr>(floorDiv ? floorDiv.getLHS() : expr).getPosition();
+    Value numBlocks = getDimOp(b, loc, input, inputDim);
+    if (floorDiv) {
+      Value block = arith::ConstantIndexOp::create(
+          b, loc, cast<AffineConstantExpr>(floorDiv.getRHS()).getValue());
+      Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+      assertEqual(arith::RemUIOp::create(b, loc, numBlocks, block), zero,
+                  "block_size must divide the input dimensions");
+      numBlocks = arith::DivUIOp::create(b, loc, numBlocks, block);
+    }
+    Value scaleSize = getDimOp(b, loc, scale, scaleDim);
+    assertEqual(scaleSize, numBlocks, "scale must have one element per block");
+    if (zeroPoint)
+      assertEqual(getDimOp(b, loc, zeroPoint, scaleDim), scaleSize,
+                  "zero_point must have the shape of scale");
+  }
+}
+
+template <typename OpTy, typename AdaptorTy>
+static FailureOr<Value> createTorchaoAffineGeneric(
+    OpTy op, AdaptorTy adaptor, ConversionPatternRewriter &rewriter,
+    const TypeConverter *typeConverter, bool hasZeroPoint,
+    function_ref<void(OpBuilder &, Location, ValueRange)> bodyBuild) {
+  SmallVector<int64_t> blockSize;
+  if (!matchPattern(op.getBlockSize(), m_TorchListOfConstantInts(blockSize)))
+    return rewriter.notifyMatchFailure(op, "block_size must be constant");
+
+  Location loc = op.getLoc();
+  Value input = adaptor.getInput();
+  Value scale = adaptor.getScale();
+  Value zeroPoint = adaptor.getZeroPoint();
+  auto inputType = cast<RankedTensorType>(input.getType());
+  auto scaleType = cast<RankedTensorType>(scale.getType());
+  auto zeroPointType = dyn_cast<RankedTensorType>(zeroPoint.getType());
+  if (hasZeroPoint &&
+      (!zeroPointType || zeroPointType.getShape() != scaleType.getShape()))
+    return rewriter.notifyMatchFailure(
+        op, "zero_point must be a tensor with the shape of scale");
+
+  FailureOr<SmallVector<AffineMap>> indexingMaps =
+      getPerBlockIndexingMaps(rewriter, inputType.getShape(), blockSize,
+                              scaleType.getShape(), hasZeroPoint);
+  if (failed(indexingMaps))
+    return rewriter.notifyMatchFailure(op,
+                                       "scale layout must match block_size");
+  assertPerBlockShapes(rewriter, loc, input, scale,
+                       hasZeroPoint ? zeroPoint : Value(), (*indexingMaps)[1]);
+
+  SmallVector<Value> inputs = {input, scale};
+  if (hasZeroPoint)
+    inputs.push_back(zeroPoint);
+  auto resultType =
+      cast<RankedTensorType>(typeConverter->convertType(op.getType()));
+  Value init = tensor::EmptyOp::create(
+      rewriter, loc, getAsOpFoldResult(getTensorSizes(rewriter, loc, input)),
+      resultType.getElementType());
+  SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(),
+                                                 utils::IteratorType::parallel);
+  Value generic =
+      linalg::GenericOp::create(rewriter, loc, init.getType(), inputs, init,
+                                *indexingMaps, iteratorTypes, bodyBuild)
+          .getResult(0);
+  return tensor::CastOp::create(rewriter, loc, resultType, generic).getResult();
+}
+
+class ConvertTorchaoQuantizeAffineOp
+    : public OpConversionPattern<TorchaoQuantizeAffineOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(TorchaoQuantizeAffineOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (LogicalResult result = verifyLinalgCompatibleTypes(op, rewriter);
+        failed(result))
+      return result;
+    if (!isa_and_present<mlir::IntegerType>(
+            cast<BaseTensorType>(op.getType()).getOptionalDtype()))
+      return rewriter.notifyMatchFailure(
+          op, "output_dtype must be an integer type");
+
+    FailureOr<std::pair<int64_t, int64_t>> bounds = getTorchaoQuantBounds(
+        op.getQuantMin(), op.getQuantMax(), op.getOutputDtype());
+    if (failed(bounds))
+      return rewriter.notifyMatchFailure(
+          op, "quant_min/max must be constant, or None with an integer "
+              "output_dtype");
+    int64_t quantMin = bounds->first, quantMax = bounds->second;
+    bool resultIsUnsigned = torch_to_linalg::isUnsignedTorchType(op.getType());
+
+    // torchao multiplies in the promoted dtype of input and scale, and adds a
+    // floating-point zero point in the promoted dtype of all three.
+    FailureOr<Type> computeType =
+        getPromotedFloatType({op.getInput(), op.getScale()});
+    if (failed(computeType))
+      return rewriter.notifyMatchFailure(
+          op, "input and scale must promote to a float dtype");
+    FailureOr<Type> addType =
+        getPromotedFloatType({op.getInput(), op.getScale(), op.getZeroPoint()});
+    if (failed(addType))
+      addType = computeType;
+
+    FailureOr<Value> result = createTorchaoAffineGeneric(
+        op, adaptor, rewriter, getTypeConverter(), /*hasZeroPoint=*/true,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Value input = convertScalarToDtype(b, loc, args[0], *computeType);
+          Value qmin = arith::ConstantOp::create(
+              b, loc, b.getFloatAttr(*addType, static_cast<double>(quantMin)));
+          Value qmax = arith::ConstantOp::create(
+              b, loc, b.getFloatAttr(*addType, static_cast<double>(quantMax)));
+          Value value = createQuantizePayload(
+              b, loc, getTypeConverter(), input, args[1], args[2], qmin, qmax,
+              args.back().getType(), resultIsUnsigned,
+              /*roundBeforeAdd=*/true, getZeroPointDtype(op.getZeroPoint()),
+              /*multiplyByReciprocal=*/true, *addType);
+          linalg::YieldOp::create(b, loc, value);
+        });
+    if (failed(result))
+      return failure();
+    rewriter.replaceOp(op, *result);
+    return success();
+  }
+};
+
+class ConvertTorchaoDequantizeAffineOp
+    : public OpConversionPattern<TorchaoDequantizeAffineOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(TorchaoDequantizeAffineOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (LogicalResult result = verifyLinalgCompatibleTypes(op, rewriter);
+        failed(result))
+      return result;
+    bool hasZeroPoint = !isa<Torch::NoneType>(op.getZeroPoint().getType());
+    // torchao subtracts in output_dtype and multiplies in the promoted dtype
+    // of output and scale.
+    FailureOr<Type> computeType =
+        getPromotedFloatType({op.getResult(), op.getScale()});
+    if (failed(computeType))
+      return rewriter.notifyMatchFailure(
+          op, "output and scale must promote to a float dtype");
+
+    FailureOr<Value> result = createTorchaoAffineGeneric(
+        op, adaptor, rewriter, getTypeConverter(), hasZeroPoint,
+        [&](OpBuilder &b, Location loc, ValueRange args) {
+          Type outputType = args.back().getType();
+          Value value = convertScalarToDtype(
+              b, loc, args[0], outputType,
+              cast<BaseTensorType>(op.getInput().getType()).getDtype());
+          if (hasZeroPoint) {
+            Value zeroPoint =
+                convertScalarToDtype(b, loc, args[2], outputType,
+                                     getZeroPointDtype(op.getZeroPoint()));
+            value = arith::SubFOp::create(b, loc, value, zeroPoint);
+          }
+          value = convertScalarToDtype(b, loc, value, *computeType);
+          Value scale = convertScalarToDtype(b, loc, args[1], *computeType);
+          value = arith::MulFOp::create(b, loc, value, scale);
+          value = convertScalarToDtype(b, loc, value, outputType);
+          linalg::YieldOp::create(b, loc, value);
+        });
+    if (failed(result))
+      return failure();
+    rewriter.replaceOp(op, *result);
     return success();
   }
 };
@@ -5119,6 +5357,10 @@ void mlir::torch::torch_to_linalg::populateUncategorizedPatternsAndLegality(
   patterns.add<ConvertQuantizedDecomposedQuantizePerChannelOp,
                ConvertQuantizedDecomposedDequantizePerChannelOp>(typeConverter,
                                                                  context);
+  target.addIllegalOp<TorchaoQuantizeAffineOp, TorchaoDequantizeAffineOp>();
+  patterns
+      .add<ConvertTorchaoQuantizeAffineOp, ConvertTorchaoDequantizeAffineOp>(
+          typeConverter, context);
   patterns.add<ConvertElementwiseOp>(typeConverter, context);
   target.addIllegalOp<AtenNllLossForwardOp>();
   patterns.add<ConvertAtenDetachOp>(typeConverter, context);

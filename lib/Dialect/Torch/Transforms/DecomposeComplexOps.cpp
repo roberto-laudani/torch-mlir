@@ -13194,6 +13194,190 @@ public:
 };
 } // namespace
 
+// Views `tensor` with the given sizes.
+static Value viewWithSizes(PatternRewriter &rewriter, Location loc,
+                           Value tensor, ArrayRef<Value> sizes) {
+  Value sizeList = PrimListConstructOp::create(
+      rewriter, loc, Torch::ListType::get(rewriter.getType<Torch::IntType>()),
+      sizes);
+  Type dtype = cast<BaseTensorType>(tensor.getType()).getOptionalDtype();
+  return AtenViewOp::create(rewriter, loc,
+                            getTensorTypeFromShapeValues(sizes, dtype), tensor,
+                            sizeList);
+}
+
+// Returns the sizes of `input` and torchao's shape_for_reduction and
+// shape_after_reduction for `blockSize`: every dimension that holds several
+// blocks is split into (blocks, block size), and the scale and zero point are
+// viewed with size 1 for the block size. See _get_reduction_params in
+// torchao/quantization/quant_primitives.py.
+static LogicalResult
+getTorchaoReductionShapes(PatternRewriter &rewriter, Location loc, Value input,
+                          Value blockSizeList, SmallVector<Value> &inputShape,
+                          SmallVector<Value> &shapeForReduction,
+                          SmallVector<Value> &shapeAfterReduction) {
+  SmallVector<int64_t> blockSize;
+  auto inputType = cast<BaseTensorType>(input.getType());
+  if (!matchPattern(blockSizeList, m_TorchListOfConstantInts(blockSize)) ||
+      !inputType.hasSizes())
+    return failure();
+  ArrayRef<int64_t> inputSizes = inputType.getSizes();
+  Value one =
+      ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
+  for (auto [dim, block] : llvm::enumerate(blockSize)) {
+    Value size = getTensorDimSize(rewriter, input, dim);
+    inputShape.push_back(size);
+    if (block != inputSizes[dim] && block > 1) {
+      Value blockValue = ConstantIntOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(block));
+      Value numBlocks =
+          rewriter.createOrFold<AtenFloordivIntOp>(loc, size, blockValue);
+      shapeForReduction.append({numBlocks, blockValue});
+      shapeAfterReduction.append({numBlocks, one});
+    } else {
+      shapeForReduction.push_back(size);
+      shapeAfterReduction.push_back(block == 1 ? size : one);
+    }
+  }
+  return success();
+}
+
+namespace {
+// Decompose torchao.quantize_affine as torchao computes it:
+//   clamp(round(input * (1 / scale)) + zero_point, quant_min, quant_max)
+// on the blocked views, then view back and convert to the result dtype.
+class DecomposeTorchaoQuantizeAffineOp
+    : public OpRewritePattern<TorchaoQuantizeAffineOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(TorchaoQuantizeAffineOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto resultType = cast<BaseTensorType>(op.getType());
+    if (!resultType.hasDtype())
+      return rewriter.notifyMatchFailure(op, "expected a result dtype");
+    if (!isa<BaseTensorType>(op.getZeroPoint().getType()))
+      return rewriter.notifyMatchFailure(op, "zero_point must be a tensor");
+
+    FailureOr<Type> computeType =
+        getPromotedFloatType({op.getInput(), op.getScale()});
+    if (failed(computeType))
+      return rewriter.notifyMatchFailure(
+          op, "input and scale must promote to a float dtype");
+    FailureOr<Type> addType =
+        getPromotedFloatType({op.getInput(), op.getScale(), op.getZeroPoint()});
+    if (failed(addType))
+      addType = computeType;
+    FailureOr<std::pair<int64_t, int64_t>> bounds = getTorchaoQuantBounds(
+        op.getQuantMin(), op.getQuantMax(), op.getOutputDtype());
+    if (failed(bounds))
+      return rewriter.notifyMatchFailure(
+          op, "quant_min/max must be constant, or None with an integer "
+              "output_dtype");
+    SmallVector<Value> inputShape, shapeForReduction, shapeAfterReduction;
+    if (failed(getTorchaoReductionShapes(
+            rewriter, loc, op.getInput(), op.getBlockSize(), inputShape,
+            shapeForReduction, shapeAfterReduction)))
+      return rewriter.notifyMatchFailure(op, "block_size must be constant");
+
+    Value input =
+        viewWithSizes(rewriter, loc, op.getInput(), shapeForReduction);
+    Value scale =
+        viewWithSizes(rewriter, loc, op.getScale(), shapeAfterReduction);
+    Value zeroPoint =
+        viewWithSizes(rewriter, loc, op.getZeroPoint(), shapeAfterReduction);
+    Type blocksType =
+        getTensorTypeFromShapeValues(shapeForReduction, *computeType);
+    Type addBlocksType =
+        getTensorTypeFromShapeValues(shapeForReduction, *addType);
+    Value one =
+        ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
+    Value quantMin = ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(bounds->first));
+    Value quantMax = ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(bounds->second));
+
+    Value reciprocal =
+        AtenReciprocalOp::create(rewriter, loc, scale.getType(), scale);
+    Value value =
+        AtenMulTensorOp::create(rewriter, loc, blocksType, input, reciprocal);
+    value = AtenRoundOp::create(rewriter, loc, blocksType, value);
+    value = AtenAddTensorOp::create(rewriter, loc, addBlocksType, value,
+                                    zeroPoint, one);
+    value = AtenClampOp::create(rewriter, loc, addBlocksType, value, quantMin,
+                                quantMax);
+    value = viewWithSizes(rewriter, loc, value, inputShape);
+
+    Value none = ConstantNoneOp::create(rewriter, loc);
+    Value falseVal = ConstantBoolOp::create(rewriter, loc, false);
+    rewriter.replaceOpWithNewOp<AtenToDtypeOp>(
+        op, op.getType(), value,
+        getDtypeIntValueForType(rewriter, loc, resultType.getDtype()), falseVal,
+        falseVal, none);
+    return success();
+  }
+};
+} // namespace
+
+namespace {
+// Decompose torchao.dequantize_affine as torchao computes it:
+//   (input.to(output_dtype) - zero_point.to(output_dtype)) * scale
+// on the blocked views, then view back and convert to output_dtype.
+class DecomposeTorchaoDequantizeAffineOp
+    : public OpRewritePattern<TorchaoDequantizeAffineOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(TorchaoDequantizeAffineOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    bool hasZeroPoint = !isa<Torch::NoneType>(op.getZeroPoint().getType());
+    if (hasZeroPoint && !isa<BaseTensorType>(op.getZeroPoint().getType()))
+      return rewriter.notifyMatchFailure(op,
+                                         "zero_point must be None or a tensor");
+    FailureOr<Type> computeType =
+        getPromotedFloatType({op.getResult(), op.getScale()});
+    if (failed(computeType))
+      return rewriter.notifyMatchFailure(
+          op, "output and scale must promote to a float dtype");
+    SmallVector<Value> inputShape, shapeForReduction, shapeAfterReduction;
+    if (failed(getTorchaoReductionShapes(
+            rewriter, loc, op.getInput(), op.getBlockSize(), inputShape,
+            shapeForReduction, shapeAfterReduction)))
+      return rewriter.notifyMatchFailure(op, "block_size must be constant");
+
+    Type outputDtype = cast<BaseTensorType>(op.getType()).getDtype();
+    Value input =
+        viewWithSizes(rewriter, loc, op.getInput(), shapeForReduction);
+    Value scale =
+        viewWithSizes(rewriter, loc, op.getScale(), shapeAfterReduction);
+    Value value = convertTensorToDtype(rewriter, loc, input, outputDtype);
+    if (hasZeroPoint) {
+      Value zeroPoint = convertTensorToDtype(
+          rewriter, loc,
+          viewWithSizes(rewriter, loc, op.getZeroPoint(), shapeAfterReduction),
+          outputDtype);
+      Value one =
+          ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
+      value = AtenSubTensorOp::create(rewriter, loc, value.getType(), value,
+                                      zeroPoint, one);
+    }
+    value = AtenMulTensorOp::create(
+        rewriter, loc,
+        getTensorTypeFromShapeValues(shapeForReduction, *computeType), value,
+        scale);
+    value = viewWithSizes(rewriter, loc, value, inputShape);
+
+    Value none = ConstantNoneOp::create(rewriter, loc);
+    Value falseVal = ConstantBoolOp::create(rewriter, loc, false);
+    rewriter.replaceOpWithNewOp<AtenToDtypeOp>(
+        op, op.getType(), value,
+        getDtypeIntValueForType(rewriter, loc, outputDtype), falseVal, falseVal,
+        none);
+    return success();
+  }
+};
+} // namespace
+
 namespace {
 // Decompose aten.fmax/fmin to aten.maximum/minimum + aten.where(nanMask)
 template <typename AtenFOpT, typename AtenOpT>
@@ -13789,7 +13973,8 @@ private:
     // on `Operation *` are not allowed, since there is no way of telling if
     // that pattern will match on an op in the `legalOpsSet` or not.
     assert(opName && "All decomposition patterns must target a single op");
-    if (!legalOpsSet.contains(opName->getStringRef().ltrim(kTorchOpPrefix)))
+    if (!legalOpsSet.contains(
+            opName->getStringRef().drop_front(strlen(kTorchOpPrefix))))
       patterns.add<DecomposePattern>(context);
   }
 
@@ -14052,6 +14237,8 @@ public:
     addPatternIfTargetOpIsIllegal<DecomposeAtenEluOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenFakeQuantizePerTensorAffineOp>(
         patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeTorchaoQuantizeAffineOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeTorchaoDequantizeAffineOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenSeluOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenLeakyReluOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenLeakyReluBackwardOp>(patterns);

@@ -1884,4 +1884,91 @@ def Torch_QuantizedDecomposedChooseQparamsPerTokenOp : Torch_Op<
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// torchao quantization ops
+// Hand-authored for the torchao affine quantization ops that appear in graphs
+// exported from torchao's quantize_ API and from PT2E with affine observers.
+//===----------------------------------------------------------------------===//
+
+def Torch_TorchaoQuantizeAffineOp : Torch_Op<"torchao.quantize_affine", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let hasVerifier = 1;
+  let summary = "torchao quantize_affine";
+  let description = [{
+    Quantizes `input` blockwise, producing an `output_dtype` tensor:
+
+    ```
+    result = clamp(round(input * (1 / scale)) + zero_point,
+                   quant_min, quant_max)
+    ```
+
+    `round` breaks ties to even. All elements of a `block_size` block share
+    one `scale` and `zero_point` value, e.g. `[1, 128]` quantizes groups of
+    128 along the last dimension. A None bound is the bound of `output_dtype`.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    AnyTorchListOfTorchIntType:$block_size,
+    AnyTorchTensorType:$scale,
+    AnyTorchOptionalTensorType:$zero_point,
+    Torch_IntType:$output_dtype,
+    AnyTorchOptionalScalarType:$quant_min,
+    AnyTorchOptionalScalarType:$quant_max
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $block_size `,` $scale `,` $zero_point `,` $output_dtype `,`
+        $quant_min `,` $quant_max attr-dict
+    `:` qualified(type($input)) `,` qualified(type($block_size)) `,`
+        qualified(type($scale)) `,` qualified(type($zero_point)) `,`
+        qualified(type($output_dtype)) `,` qualified(type($quant_min)) `,`
+        qualified(type($quant_max))
+    `->` qualified(type($result))
+  }];
+}
+
+def Torch_TorchaoDequantizeAffineOp : Torch_Op<"torchao.dequantize_affine", [
+    AllowsTypeRefinement,
+    HasValueSemantics,
+    ReadOnly,
+  ]> {
+  let hasVerifier = 1;
+  let summary = "torchao dequantize_affine";
+  let description = [{
+    Dequantizes `input` blockwise, producing an `output_dtype` tensor:
+
+    ```
+    result = (input - zero_point) * scale
+    ```
+
+    See `torch.torchao.quantize_affine` for the meaning of `block_size`.
+    The subtraction is performed in `output_dtype`, so `zero_point` may be a
+    floating-point tensor; a None `zero_point` skips it. `quant_min` and
+    `quant_max` only describe the range of `input` and do not clamp.
+  }];
+  let arguments = (ins
+    AnyTorchTensorType:$input,
+    AnyTorchListOfTorchIntType:$block_size,
+    AnyTorchTensorType:$scale,
+    AnyTorchOptionalTensorType:$zero_point,
+    Torch_IntType:$input_dtype,
+    AnyTorchOptionalScalarType:$quant_min,
+    AnyTorchOptionalScalarType:$quant_max,
+    Torch_IntType:$output_dtype
+  );
+  let results = (outs AnyTorchTensorType:$result);
+  let assemblyFormat = [{
+    $input `,` $block_size `,` $scale `,` $zero_point `,` $input_dtype `,`
+        $quant_min `,` $quant_max `,` $output_dtype attr-dict
+    `:` qualified(type($input)) `,` qualified(type($block_size)) `,`
+        qualified(type($scale)) `,` qualified(type($zero_point)) `,`
+        qualified(type($input_dtype)) `,` qualified(type($quant_min)) `,`
+        qualified(type($quant_max)) `,` qualified(type($output_dtype))
+    `->` qualified(type($result))
+  }];
+}
+
 #endif // TORCH_OPS

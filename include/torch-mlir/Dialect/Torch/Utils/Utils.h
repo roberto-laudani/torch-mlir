@@ -243,6 +243,17 @@ ValueTensorType getTensorTypeFromShapeValues(ArrayRef<Value> shapes,
                                              Type dtype);
 Value getTensorDimSize(PatternRewriter &rewriter, Value tensor, int64_t dim);
 
+// Returns the float dtype that PyTorch promotes `tensors` to in arithmetic, for
+// tensors with dimensions; the special rule for 0-dim tensors is not applied.
+// Fails unless every tensor has a float dtype.
+FailureOr<Type> getPromotedFloatType(ValueRange tensors);
+
+// Returns the constant quantization bounds `quantMin` and `quantMax` of a
+// torchao quantization op. A None bound is the bound of the integer dtype
+// `dtype`, as in torchao.
+FailureOr<std::pair<int64_t, int64_t>>
+getTorchaoQuantBounds(Value quantMin, Value quantMax, Value dtype);
+
 // In Dynamo import paths, we can assume that dynamic dimensions are strictly
 // quantities and are not ambiguous with '1' symbols that can be interpreted
 // to signal an expansion in various broadcasting scenarios. In the

@@ -270,6 +270,102 @@ func.func @torch.aten._fake_quantize_per_tensor_affine_cachemask_tensor_qparams(
 
 // -----
 
+// CHECK-LABEL:   func.func @torch.torchao.quantize_affine(
+// CHECK-SAME:        %[[INPUT:.*]]: !torch.vtensor<[4,16],bf16>, %[[SCALE:.*]]: !torch.vtensor<[4,2],bf16>, %[[ZP:.*]]: !torch.vtensor<[4,2],f32>)
+// CHECK-DAG:       %[[QMIN:.*]] = torch.constant.int 0
+// CHECK-DAG:       %[[QMAX:.*]] = torch.constant.int 15
+// CHECK:           %[[INPUT_VIEW:.*]] = torch.aten.view %[[INPUT]], %{{.*}} -> !torch.vtensor<[4,2,8],bf16>
+// CHECK:           %[[SCALE_VIEW:.*]] = torch.aten.view %[[SCALE]], %{{.*}} -> !torch.vtensor<[4,2,1],bf16>
+// CHECK:           %[[ZP_VIEW:.*]] = torch.aten.view %[[ZP]], %{{.*}} -> !torch.vtensor<[4,2,1],f32>
+// CHECK:           %[[RCP:.*]] = torch.aten.reciprocal %[[SCALE_VIEW]] : !torch.vtensor<[4,2,1],bf16> -> !torch.vtensor<[4,2,1],bf16>
+// CHECK:           %[[MUL:.*]] = torch.aten.mul.Tensor %[[INPUT_VIEW]], %[[RCP]] : {{.*}} -> !torch.vtensor<[4,2,8],bf16>
+// CHECK:           %[[ROUND:.*]] = torch.aten.round %[[MUL]] : {{.*}} -> !torch.vtensor<[4,2,8],bf16>
+// CHECK:           %[[ADD:.*]] = torch.aten.add.Tensor %[[ROUND]], %[[ZP_VIEW]], %{{.*}} -> !torch.vtensor<[4,2,8],f32>
+// CHECK:           %[[CLAMP:.*]] = torch.aten.clamp %[[ADD]], %[[QMIN]], %[[QMAX]]
+// CHECK:           %[[VIEW:.*]] = torch.aten.view %[[CLAMP]], %{{.*}} -> !torch.vtensor<[4,16],f32>
+// CHECK:           torch.aten.to.dtype %[[VIEW]], %{{.*}} -> !torch.vtensor<[4,16],ui8>
+func.func @torch.torchao.quantize_affine(
+    %input: !torch.vtensor<[4,16],bf16>,
+    %scale: !torch.vtensor<[4,2],bf16>,
+    %zero_point: !torch.vtensor<[4,2],f32>)
+    -> !torch.vtensor<[4,16],ui8> {
+  %int1 = torch.constant.int 1
+  %int8 = torch.constant.int 8
+  %dtype = torch.constant.int 33
+  %qmin = torch.constant.int 0
+  %none = torch.constant.none
+  %block_size = torch.prim.ListConstruct %int1, %int8
+      : (!torch.int, !torch.int) -> !torch.list<int>
+  %out = torch.torchao.quantize_affine
+      %input, %block_size, %scale, %zero_point, %dtype, %qmin, %none
+      : !torch.vtensor<[4,16],bf16>, !torch.list<int>,
+        !torch.vtensor<[4,2],bf16>, !torch.vtensor<[4,2],f32>, !torch.int,
+        !torch.int, !torch.none -> !torch.vtensor<[4,16],ui8>
+  return %out : !torch.vtensor<[4,16],ui8>
+}
+
+// -----
+
+// CHECK-LABEL:   func.func @torch.torchao.dequantize_affine(
+// CHECK:           %[[INPUT_BF16:.*]] = torch.aten.to.dtype %{{.*}} -> !torch.vtensor<[4,16],bf16>
+// CHECK:           %[[ZP_BF16:.*]] = torch.aten.to.dtype %{{.*}} -> !torch.vtensor<[4,1],bf16>
+// CHECK:           %[[SUB:.*]] = torch.aten.sub.Tensor %[[INPUT_BF16]], %[[ZP_BF16]], %{{.*}} -> !torch.vtensor<[4,16],bf16>
+// CHECK:           torch.aten.mul.Tensor %[[SUB]], %{{.*}} : {{.*}} -> !torch.vtensor<[4,16],f32>
+// CHECK:           torch.aten.to.dtype %{{.*}} -> !torch.vtensor<[4,16],bf16>
+func.func @torch.torchao.dequantize_affine(
+    %input: !torch.vtensor<[4,16],si8>,
+    %scale: !torch.vtensor<[4,1],f32>,
+    %zero_point: !torch.vtensor<[4,1],f32>)
+    -> !torch.vtensor<[4,16],bf16> {
+  %int1 = torch.constant.int 1
+  %int16 = torch.constant.int 16
+  %dtype = torch.constant.int 1
+  %out_dtype = torch.constant.int 15
+  %none = torch.constant.none
+  %block_size = torch.prim.ListConstruct %int1, %int16
+      : (!torch.int, !torch.int) -> !torch.list<int>
+  %out = torch.torchao.dequantize_affine
+      %input, %block_size, %scale, %zero_point, %dtype, %none, %none, %out_dtype
+      : !torch.vtensor<[4,16],si8>, !torch.list<int>, !torch.vtensor<[4,1],f32>,
+        !torch.vtensor<[4,1],f32>, !torch.int, !torch.none, !torch.none,
+        !torch.int -> !torch.vtensor<[4,16],bf16>
+  return %out : !torch.vtensor<[4,16],bf16>
+}
+
+// -----
+
+// A zero point typed as optional is not decomposed.
+// CHECK-LABEL:   func.func @torch.torchao.quantize_affine$optional_zero_point(
+// CHECK:           torch.torchao.quantize_affine
+// CHECK:           torch.torchao.dequantize_affine
+func.func @torch.torchao.quantize_affine$optional_zero_point(
+    %input: !torch.vtensor<[4,16],f32>,
+    %scale: !torch.vtensor<[4,2],f32>,
+    %zero_point: !torch.optional<vtensor>)
+    -> !torch.vtensor<[4,16],f32> {
+  %int1 = torch.constant.int 1
+  %int8 = torch.constant.int 8
+  %dtype = torch.constant.int 1
+  %out_dtype = torch.constant.int 6
+  %qmin = torch.constant.int -128
+  %qmax = torch.constant.int 127
+  %block_size = torch.prim.ListConstruct %int1, %int8
+      : (!torch.int, !torch.int) -> !torch.list<int>
+  %q = torch.torchao.quantize_affine
+      %input, %block_size, %scale, %zero_point, %dtype, %qmin, %qmax
+      : !torch.vtensor<[4,16],f32>, !torch.list<int>,
+        !torch.vtensor<[4,2],f32>, !torch.optional<vtensor>, !torch.int,
+        !torch.int, !torch.int -> !torch.vtensor<[4,16],si8>
+  %out = torch.torchao.dequantize_affine
+      %q, %block_size, %scale, %zero_point, %dtype, %qmin, %qmax, %out_dtype
+      : !torch.vtensor<[4,16],si8>, !torch.list<int>, !torch.vtensor<[4,2],f32>,
+        !torch.optional<vtensor>, !torch.int, !torch.int, !torch.int,
+        !torch.int -> !torch.vtensor<[4,16],f32>
+  return %out : !torch.vtensor<[4,16],f32>
+}
+
+// -----
+
 // CHECK-LABEL:   func.func @torch.aten.fake_quantize_per_channel_affine_cachemask(
 // CHECK-SAME:                                 %[[ARG_0:.*]]: !torch.vtensor<[?,?,?,?],f32>, %[[ARG_1:.*]]: !torch.vtensor<[?],f32>,
 // CHECK-SAME:                                 %[[ARG_2:.*]]: !torch.vtensor<[?],si32>) -> !torch.vtensor<[?,?,?,?],f32> {
