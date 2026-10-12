@@ -34,8 +34,12 @@ if hasattr(torch.ops.aten, "scaled_dot_product_attention"):
     DEFAULT_DECOMPOSITIONS.append(torch.ops.aten.scaled_dot_product_attention)
 
 
-def get_decomposition_table():
-    return get_expanded_decomposition_table()
+def get_decomposition_table(backend_legal_ops=None):
+    table = get_expanded_decomposition_table()
+    keep = set(_KEEP_IF_BACKEND_LEGAL).intersection(backend_legal_ops or [])
+    if not keep:
+        return table
+    return {k: v for k, v in table.items() if str(k._overloadpacket) not in keep}
 
 
 _EXPANDED_DECOMP_EXCLUDE = [
@@ -80,6 +84,14 @@ _EXPANDED_DECOMP_EXCLUDE = [
     torch.ops.aten.logaddexp2,
     torch.ops.aten.eye,
     torch.ops.aten.isclose,
+]
+
+
+# First-class ops that are not decomposed when the backend lists them as legal.
+# They are matched by name because torchao is an optional dependency.
+_KEEP_IF_BACKEND_LEGAL = [
+    "torchao.quantize_affine",
+    "torchao.dequantize_affine",
 ]
 
 

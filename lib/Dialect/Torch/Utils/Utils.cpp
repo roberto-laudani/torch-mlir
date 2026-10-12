@@ -247,6 +247,80 @@ Value Torch::getTensorDimSize(PatternRewriter &rewriter, Value tensor,
   return rewriter.createOrFold<AtenSizeIntOp>(loc, tensor, dimVal);
 }
 
+FailureOr<Type> Torch::getPromotedFloatType(ValueRange tensors) {
+  auto promoted = torch_upstream::ScalarType::Undefined;
+  for (Value tensor : tensors) {
+    auto tensorType = dyn_cast<BaseTensorType>(tensor.getType());
+    auto dtype = dyn_cast_if_present<mlir::FloatType>(
+        tensorType ? tensorType.getOptionalDtype() : Type());
+    if (!dtype)
+      return failure();
+    promoted = torch_upstream::promote_skip_undefined(
+        promoted, getScalarTypeForType(dtype));
+  }
+  FailureOr<Type> promotedType =
+      getTypeForScalarType(tensors.front().getContext(), promoted);
+  if (failed(promotedType) || !isa<mlir::FloatType>(*promotedType))
+    return failure();
+  return promotedType;
+}
+
+// The bounds of the torchao quantized integer dtypes that quantize_affine can
+// produce, from `_DTYPE_TO_QVALUE_BOUNDS` in
+// torchao/quantization/quant_primitives.py. torchao stores uint1-uint7 results
+// in uint8; PyTorch has no kernels for int1-int7 results.
+static std::optional<std::pair<int64_t, int64_t>>
+getTorchaoDtypeBounds(int64_t dtypeInt) {
+  using torch_upstream::ScalarType;
+  auto bounds = [](unsigned width,
+                   bool isSigned) -> std::pair<int64_t, int64_t> {
+    if (isSigned)
+      return {llvm::minIntN(width), llvm::maxIntN(width)};
+    return {0, static_cast<int64_t>(llvm::maxUIntN(width))};
+  };
+  switch (static_cast<ScalarType>(dtypeInt)) {
+  case ScalarType::Byte:
+    return bounds(8, /*isSigned=*/false);
+  case ScalarType::Char:
+    return bounds(8, /*isSigned=*/true);
+  case ScalarType::Short:
+    return bounds(16, /*isSigned=*/true);
+  case ScalarType::Int:
+    return bounds(32, /*isSigned=*/true);
+  case ScalarType::UInt1:
+  case ScalarType::UInt2:
+  case ScalarType::UInt3:
+  case ScalarType::UInt4:
+  case ScalarType::UInt5:
+  case ScalarType::UInt6:
+  case ScalarType::UInt7:
+    return bounds(dtypeInt - static_cast<int64_t>(ScalarType::UInt1) + 1,
+                  /*isSigned=*/false);
+  default:
+    return std::nullopt;
+  }
+}
+
+FailureOr<std::pair<int64_t, int64_t>>
+Torch::getTorchaoQuantBounds(Value quantMin, Value quantMax, Value dtype) {
+  bool quantMinIsNone = isa<Torch::NoneType>(quantMin.getType());
+  bool quantMaxIsNone = isa<Torch::NoneType>(quantMax.getType());
+  int64_t qmin, qmax;
+  if (quantMinIsNone || quantMaxIsNone) {
+    int64_t dtypeInt;
+    std::optional<std::pair<int64_t, int64_t>> dtypeBounds;
+    if (matchPattern(dtype, m_TorchConstantInt(&dtypeInt)))
+      dtypeBounds = getTorchaoDtypeBounds(dtypeInt);
+    if (!dtypeBounds)
+      return failure();
+    std::tie(qmin, qmax) = *dtypeBounds;
+  }
+  if ((!quantMinIsNone && !matchPattern(quantMin, m_TorchConstantInt(&qmin))) ||
+      (!quantMaxIsNone && !matchPattern(quantMax, m_TorchConstantInt(&qmax))))
+    return failure();
+  return std::make_pair(qmin, qmax);
+}
+
 // Checks whether the inputs are broadcast compatible or not. If
 // yes, then computes the final broadcast shape.
 void Torch::computeBroadcastShape(PatternRewriter &rewriter, Location loc,

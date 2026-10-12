@@ -65,3 +65,12 @@ def register_all_tests():
     from . import meshgrid
     from . import timeout
     from . import kl_div_loss
+
+    # torchao is an optional dependency. A torchao build that doesn't match the
+    # installed torch can fail to import with errors other than ImportError.
+    try:
+        import torchao  # noqa: F401
+    except Exception:
+        pass
+    else:
+        from . import torchao_quantized_models

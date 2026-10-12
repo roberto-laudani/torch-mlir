@@ -7965,3 +7965,63 @@ LogicalResult QuantizedDecomposedDequantizePerTokenOp::verify() {
       cast<BaseTensorType>(getScales().getType()),
       cast<BaseTensorType>(getZeroPoints().getType()));
 }
+
+//===----------------------------------------------------------------------===//
+// TorchaoQuantizeAffineOp
+//===----------------------------------------------------------------------===//
+
+static LogicalResult verifyPerBlockQuantShapes(Operation *op, Value input,
+                                               Value blockSize, Value scale,
+                                               Value zeroPoint) {
+  auto scaleType = cast<BaseTensorType>(scale.getType());
+  auto zeroPointType = dyn_cast<BaseTensorType>(zeroPoint.getType());
+  int64_t scaleNumel =
+      scaleType.hasSizes() ? getNumel(scaleType.getSizes()) : kUnknownSize;
+  if (zeroPointType && zeroPointType.hasSizes()) {
+    int64_t zeroPointNumel = getNumel(zeroPointType.getSizes());
+    if (scaleNumel != kUnknownSize && zeroPointNumel != kUnknownSize &&
+        zeroPointNumel != scaleNumel)
+      return op->emitOpError("zero_point must have as many elements as scale");
+  }
+
+  SmallVector<int64_t> blocks;
+  auto inputType = cast<BaseTensorType>(input.getType());
+  if (!matchPattern(blockSize, m_TorchListOfConstantInts(blocks)) ||
+      !inputType.hasSizes())
+    return success();
+
+  ArrayRef<int64_t> inputShape = inputType.getSizes();
+  if (blocks.size() != inputShape.size())
+    return op->emitOpError(
+        "block_size must have one entry per input dimension");
+
+  SmallVector<int64_t> numBlocksPerDim;
+  for (auto [size, block] : llvm::zip_equal(inputShape, blocks)) {
+    if (block < 1)
+      return op->emitOpError("block_size entries must be at least 1");
+    if (size != kUnknownSize && size % block != 0)
+      return op->emitOpError("block_size must divide the input dimensions");
+    numBlocksPerDim.push_back(size == kUnknownSize ? kUnknownSize
+                                                   : size / block);
+  }
+
+  int64_t numBlocks = getNumel(numBlocksPerDim);
+  if (scaleNumel != kUnknownSize && numBlocks != kUnknownSize &&
+      scaleNumel != numBlocks)
+    return op->emitOpError("scale must have one element per block");
+  return success();
+}
+
+LogicalResult TorchaoQuantizeAffineOp::verify() {
+  return verifyPerBlockQuantShapes(*this, getInput(), getBlockSize(),
+                                   getScale(), getZeroPoint());
+}
+
+//===----------------------------------------------------------------------===//
+// TorchaoDequantizeAffineOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult TorchaoDequantizeAffineOp::verify() {
+  return verifyPerBlockQuantShapes(*this, getInput(), getBlockSize(),
+                                   getScale(), getZeroPoint());
+}
