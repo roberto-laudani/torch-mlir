@@ -188,6 +188,85 @@ static Value buildActiveCacheSlice(ConversionPatternRewriter &rewriter,
                                           seqDim, start, end, step);
 }
 
+/// Builds the attention mask of a local window: the query at position p sees
+/// the keys p - window < k <= p. Positions are relative to activeStart, the
+/// first cached key the first query sees, so the mask has shape
+/// [1, 1, seq_len, total_seq_len - activeStart].
+static Value buildLocalWindowMask(ConversionPatternRewriter &rewriter,
+                                  Location loc, Value pastSeqLen,
+                                  Value totalSeqLen, Value seqLen,
+                                  int64_t staticSeqLen, Value activeStart,
+                                  Value window) {
+  MLIRContext *context = rewriter.getContext();
+  constexpr int64_t kDynamic = Torch::kUnknownSize;
+  auto si64Type = IntegerType::get(context, 64, IntegerType::Signed);
+  auto i1Type = rewriter.getI1Type();
+  Value cstNone = Torch::ConstantNoneOp::create(rewriter, loc);
+  Value cstDim0 = Torch::ConstantIntOp::create(rewriter, loc,
+                                               rewriter.getI64IntegerAttr(0));
+  Value cstDim1 = Torch::ConstantIntOp::create(rewriter, loc,
+                                               rewriter.getI64IntegerAttr(1));
+  Value cstInt64Dtype = Torch::ConstantIntOp::create(
+      rewriter, loc,
+      rewriter.getI64IntegerAttr((int)torch_upstream::ScalarType::Long));
+
+  // query_pos = [past_seq_len, total_seq_len) - active_start, as a column.
+  Value queryStart =
+      Torch::AtenSubIntOp::create(rewriter, loc, pastSeqLen, activeStart);
+  Value queryEnd =
+      Torch::AtenAddIntOp::create(rewriter, loc, queryStart, seqLen);
+  Value queryPos = Torch::AtenArangeStartOp::create(
+      rewriter, loc,
+      Torch::ValueTensorType::get(context, ArrayRef<int64_t>{staticSeqLen},
+                                  si64Type),
+      queryStart, queryEnd, cstInt64Dtype, /*layout=*/cstNone,
+      /*device=*/cstNone, /*pin_memory=*/cstNone);
+  queryPos = Torch::AtenUnsqueezeOp::create(
+      rewriter, loc,
+      Torch::ValueTensorType::get(context, ArrayRef<int64_t>{staticSeqLen, 1},
+                                  si64Type),
+      queryPos, cstDim1);
+
+  // key_pos = [0, total_seq_len - active_start), as a row.
+  Value keyLen =
+      Torch::AtenSubIntOp::create(rewriter, loc, totalSeqLen, activeStart);
+  Value keyPos = Torch::AtenArangeOp::create(
+      rewriter, loc,
+      Torch::ValueTensorType::get(context, ArrayRef<int64_t>{kDynamic},
+                                  si64Type),
+      keyLen, cstInt64Dtype, /*layout=*/cstNone, /*device=*/cstNone,
+      /*pin_memory=*/cstNone);
+  keyPos = Torch::AtenUnsqueezeOp::create(
+      rewriter, loc,
+      Torch::ValueTensorType::get(context, ArrayRef<int64_t>{1, kDynamic},
+                                  si64Type),
+      keyPos, cstDim0);
+
+  // mask = key_pos <= query_pos && key_pos > query_pos - window
+  auto maskType = Torch::ValueTensorType::get(
+      context, ArrayRef<int64_t>{staticSeqLen, kDynamic}, i1Type);
+  Value windowStart = Torch::AtenSubScalarOp::create(
+      rewriter, loc, queryPos.getType(), queryPos, window, /*alpha=*/cstDim1);
+  Value causal =
+      Torch::AtenLeTensorOp::create(rewriter, loc, maskType, keyPos, queryPos);
+  Value inWindow = Torch::AtenGtTensorOp::create(rewriter, loc, maskType,
+                                                 keyPos, windowStart);
+  Value mask = Torch::AtenLogicalAndOp::create(rewriter, loc, maskType, causal,
+                                               inWindow);
+
+  // Broadcast over batch and heads: [seq, keys] -> [1, 1, seq, keys].
+  mask = Torch::AtenUnsqueezeOp::create(
+      rewriter, loc,
+      Torch::ValueTensorType::get(
+          context, ArrayRef<int64_t>{1, staticSeqLen, kDynamic}, i1Type),
+      mask, cstDim0);
+  return Torch::AtenUnsqueezeOp::create(
+      rewriter, loc,
+      Torch::ValueTensorType::get(
+          context, ArrayRef<int64_t>{1, 1, staticSeqLen, kDynamic}, i1Type),
+      mask, cstDim0);
+}
+
 } // namespace
 
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
@@ -586,25 +665,66 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
           return rewriter.notifyMatchFailure(binder.op,
                                              "op attributes bind failure");
 
-        // This lowering excepts input operands to be either 7 or 9 based on the
-        // `do_rotary` attribute. If it's false, then the input operands can be
-        // 7 but if it's true then the operands has to be 9 including cos_cache
-        // and sin_cache for rotary_embedding.
-        if (!((operands.size() == 9) || (!doRotary && operands.size() == 7)))
+        // Operands follow the ONNX input order: query, key, value, past_key,
+        // past_value, seqlens_k, total_sequence_length, cos_cache, sin_cache,
+        // position_ids, attention_bias, head_sink, k_scale, v_scale,
+        // q_norm_weight, k_norm_weight. Exporters omit trailing optional
+        // inputs, and the importer turns skipped ones into !torch.none.
+        if (operands.size() < 7 || operands.size() > 16)
           return rewriter.notifyMatchFailure(
-              binder.op, "Unimplemented:  excepted input operands to be either "
-                         "7 or 9 based on the `do_rotary` attribute");
+              binder.op, "Unimplemented: expected 7 to 16 input operands");
+        auto hasOperand = [&](size_t index) {
+          return index < operands.size() &&
+                 !isa<Torch::NoneType>(operands[index].getType());
+        };
+        if (doRotary && !(hasOperand(7) && hasOperand(8)))
+          return rewriter.notifyMatchFailure(
+              binder.op,
+              "do_rotary requires the cos_cache and sin_cache inputs");
+        for (size_t index = 9; index < operands.size(); ++index) {
+          if (hasOperand(index))
+            return rewriter.notifyMatchFailure(
+                binder.op, "Unimplemented: the position_ids, attention_bias, "
+                           "head_sink, k_scale, v_scale, q_norm_weight and "
+                           "k_norm_weight inputs are not supported");
+        }
+
+        // Attributes of newer onnxruntime versions that change the result.
+        int64_t causal, qkOutput, slidingWindowCache;
+        std::string kQuantType, vQuantType;
+        if (binder.s64IntegerAttr(causal, "causal", 1) ||
+            binder.s64IntegerAttr(qkOutput, "qk_output", 0) ||
+            binder.s64IntegerAttr(slidingWindowCache, "sliding_window_cache",
+                                  0) ||
+            binder.customOpNameStringAttr(kQuantType, "k_quant_type", "NONE") ||
+            binder.customOpNameStringAttr(vQuantType, "v_quant_type", "NONE"))
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "op attributes bind failure");
+        if (causal != 1)
+          return rewriter.notifyMatchFailure(
+              binder.op,
+              "Unimplemented: non-causal attention is not supported");
+        if (qkOutput != 0)
+          return rewriter.notifyMatchFailure(
+              binder.op,
+              "Unimplemented: the output_qk output is not supported");
+        if (slidingWindowCache != 0)
+          return rewriter.notifyMatchFailure(
+              binder.op, "Unimplemented: a sliding window KV cache is not "
+                         "supported, the cache must hold the whole sequence");
+        if (kQuantType != "NONE" || vQuantType != "NONE")
+          return rewriter.notifyMatchFailure(
+              binder.op, "Unimplemented: quantized KV cache is not supported");
 
         if (kvNumHeads == 0)
           return rewriter.notifyMatchFailure(
               binder.op,
               "kv_num_heads is a required attribute and should be non-zero");
 
-        if (localWindowSize != -1)
+        if (localWindowSize != -1 && localWindowSize <= 0)
           return rewriter.notifyMatchFailure(
               binder.op,
-              "Unimplemented: local_window_size attribute is not supported, "
-              "hence it should have default value equal to -1");
+              "local_window_size should be -1 (disabled) or positive");
 
         if (numHeads == 0)
           return rewriter.notifyMatchFailure(
@@ -893,15 +1013,37 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
             rewriter, loc, pastValue.getType(), pastValue, vInput, cstCacheDim,
             pastSeqLen, totalSeqLen, cstIntOne);
 
-        // Slice active portion [0:total_seq_len] for attention.
+        // With a local window, the query at position p sees only the keys
+        // p - local_window_size < k <= p, as in onnxruntime. The active portion
+        // of the cache then starts at the first key the first query sees.
+        Value activeStart = cstIntZero;
+        Value attnMask = cstNone;
+        Value isCausal = cstTrue;
+        if (localWindowSize > 0) {
+          Value cstWindow = Torch::ConstantIntOp::create(
+              rewriter, loc, rewriter.getI64IntegerAttr(localWindowSize));
+          // active_start = max(past_seq_len + 1 - local_window_size, 0)
+          Value firstVisible = Torch::AtenSubIntOp::create(
+              rewriter, loc,
+              Torch::AtenAddIntOp::create(rewriter, loc, pastSeqLen, cstIntOne),
+              cstWindow);
+          activeStart = Torch::PrimMaxIntOp::create(rewriter, loc, firstVisible,
+                                                    cstIntZero);
+          attnMask = buildLocalWindowMask(
+              rewriter, loc, pastSeqLen, totalSeqLen, cstSequenceLength,
+              sequenceLength, activeStart, cstWindow);
+          isCausal = cstFalse;
+        }
+
+        // Slice active portion [active_start:total_seq_len] for attention.
         // KV cache layout is [batch, kv_num_heads, seq, head_size], so the
         // sequence dimension is at index 2.
         constexpr int64_t kCacheSeqDim = 2;
         Value activeKey = buildActiveCacheSlice(
-            rewriter, loc, presentKey, kCacheSeqDim, cstCacheDim, cstIntZero,
+            rewriter, loc, presentKey, kCacheSeqDim, cstCacheDim, activeStart,
             totalSeqLen, cstIntOne);
         Value activeValue = buildActiveCacheSlice(
-            rewriter, loc, presentValue, kCacheSeqDim, cstCacheDim, cstIntZero,
+            rewriter, loc, presentValue, kCacheSeqDim, cstCacheDim, activeStart,
             totalSeqLen, cstIntOne);
 
         // Do attention using the full active cache
@@ -916,8 +1058,7 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
               rewriter.getF64FloatAttr(scale));
         Value attention = Torch::AtenScaledDotProductAttentionOp::create(
             rewriter, loc, qRotary.getType(), qRotary, activeKey, activeValue,
-            /*attn_mask=*/cstNone,
-            /*dropout_p=*/cstFloatZero, /*is_causal=*/cstTrue, cstScale,
+            attnMask, /*dropout_p=*/cstFloatZero, isCausal, cstScale,
             cstEnableGQA);
         // Reshaping the attention result from:
         //    (batch_size, num_heads, sequence_length, head_size)

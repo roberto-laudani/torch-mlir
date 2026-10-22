@@ -325,3 +325,115 @@ func.func @test_group_query_attention_packed_qkv(
              -> (!torch.vtensor<[?,?,32],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>)
   return %res#0, %res#1, %res#2 : !torch.vtensor<[?,?,32],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>
 }
+
+// -----
+
+// CHECK-LABEL: @test_group_query_attention_local_window
+// CHECK-SAME:  (%[[QUERY_ARG:.+]]: !torch.vtensor<[?,?,16],f32>, %[[KEY_ARG:.+]]: !torch.vtensor<[?,?,16],f32>, %[[VALUE_ARG:.+]]: !torch.vtensor<[?,?,16],f32>,
+// CHECK-SAME:   %[[PAST_K_ARG:.+]]: !torch.vtensor<[?,2,?,8],f32>, %[[PAST_V_ARG:.+]]: !torch.vtensor<[?,2,?,8],f32>)
+// local_window_size = 4: the query at position p sees the keys p - 4 < k <= p.
+func.func @test_group_query_attention_local_window(
+  %query: !torch.vtensor<[?,?,16],f32>,
+  %key: !torch.vtensor<[?,?,16],f32>,
+  %value: !torch.vtensor<[?,?,16],f32>,
+  %past_k: !torch.vtensor<[?,2,?,8],f32>,
+  %past_v: !torch.vtensor<[?,2,?,8],f32>)
+  -> (!torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>)
+  attributes {torch.onnx_meta.ir_version = 10 : si64, torch.onnx_meta.opset_version = 22 : si64, torch.onnx_meta.producer_name = "", torch.onnx_meta.producer_version = ""} {
+  %seqlens_k = torch.operator "onnx.Constant"() {torch.onnx.value = dense<1> : tensor<1xsi32>} : () -> !torch.vtensor<[1],si32>
+  %total_seq = torch.operator "onnx.Constant"() {torch.onnx.value = dense<1> : tensor<1xsi32>} : () -> !torch.vtensor<[1],si32>
+  // CHECK-DAG:  %[[INT_0:.+]] = torch.constant.int 0
+  // CHECK-DAG:  %[[INT_1:.+]] = torch.constant.int 1
+  // CHECK:      %[[BATCH_SIZE:.+]] = torch.aten.size.int %[[QUERY_ARG]], %[[INT_0]] : {{.*}} -> !torch.int
+  // CHECK:      %[[SEQ_LEN:.+]] = torch.aten.size.int %[[QUERY_ARG]], %[[INT_1]] : {{.*}} -> !torch.int
+  // CHECK:      %[[Q_PERMUTED:.+]] = torch.aten.permute {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[FALSE:.+]] = torch.constant.bool false
+  // KV cache in-place update
+  // CHECK:      %[[TOTAL_SEQ:.+]] = torch.aten.item {{.*}} : {{.*}} -> !torch.int
+  // CHECK:      %[[PAST_SEQ:.+]] = torch.aten.sub.int %[[TOTAL_SEQ]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
+  // CHECK-DAG:  %[[STEP:.+]] = torch.constant.int 1
+  // CHECK-DAG:  %[[CACHE_DIM:.+]] = torch.constant.int 2
+  // CHECK-DAG:  %[[ZERO:.+]] = torch.constant.int 0
+  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %{{.+}}, %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], %{{.+}}, %[[CACHE_DIM]], %[[PAST_SEQ]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // First key the first query sees: active_start = max(past_seq + 1 - 4, 0)
+  // CHECK:      %[[WINDOW:.+]] = torch.constant.int 4
+  // CHECK:      %[[PAST_PLUS_ONE:.+]] = torch.aten.add.int %[[PAST_SEQ]], %[[STEP]] : {{.*}} -> !torch.int
+  // CHECK:      %[[FIRST_VISIBLE:.+]] = torch.aten.sub.int %[[PAST_PLUS_ONE]], %[[WINDOW]] : {{.*}} -> !torch.int
+  // CHECK:      %[[ACTIVE_START:.+]] = torch.prim.max.int %[[FIRST_VISIBLE]], %[[ZERO]] : {{.*}} -> !torch.int
+  // Window mask over the active keys, positions relative to active_start:
+  //   query_pos = [past_seq, total_seq) - active_start
+  //   key_pos = [0, total_seq - active_start)
+  //   mask = key_pos <= query_pos && key_pos > query_pos - 4
+  // CHECK-DAG:  %[[MASK_DIM_0:.+]] = torch.constant.int 0
+  // CHECK-DAG:  %[[MASK_DIM_1:.+]] = torch.constant.int 1
+  // CHECK-DAG:  %[[INT64:.+]] = torch.constant.int 4
+  // CHECK:      %[[QUERY_START:.+]] = torch.aten.sub.int %[[PAST_SEQ]], %[[ACTIVE_START]] : {{.*}} -> !torch.int
+  // CHECK:      %[[QUERY_END:.+]] = torch.aten.add.int %[[QUERY_START]], %[[SEQ_LEN]] : {{.*}} -> !torch.int
+  // CHECK:      %[[QUERY_POS:.+]] = torch.aten.arange.start %[[QUERY_START]], %[[QUERY_END]], %[[INT64]], {{.*}} -> !torch.vtensor<[?],si64>
+  // CHECK:      %[[QUERY_COL:.+]] = torch.aten.unsqueeze %[[QUERY_POS]], %[[MASK_DIM_1]] : {{.*}} -> !torch.vtensor<[?,1],si64>
+  // CHECK:      %[[KEY_LEN:.+]] = torch.aten.sub.int %[[TOTAL_SEQ]], %[[ACTIVE_START]] : {{.*}} -> !torch.int
+  // CHECK:      %[[KEY_POS:.+]] = torch.aten.arange %[[KEY_LEN]], %[[INT64]], {{.*}} -> !torch.vtensor<[?],si64>
+  // CHECK:      %[[KEY_ROW:.+]] = torch.aten.unsqueeze %[[KEY_POS]], %[[MASK_DIM_0]] : {{.*}} -> !torch.vtensor<[1,?],si64>
+  // CHECK:      %[[WINDOW_START:.+]] = torch.aten.sub.Scalar %[[QUERY_COL]], %[[WINDOW]], %[[MASK_DIM_1]] : {{.*}} -> !torch.vtensor<[?,1],si64>
+  // CHECK:      %[[CAUSAL:.+]] = torch.aten.le.Tensor %[[KEY_ROW]], %[[QUERY_COL]] : {{.*}} -> !torch.vtensor<[?,?],i1>
+  // CHECK:      %[[IN_WINDOW:.+]] = torch.aten.gt.Tensor %[[KEY_ROW]], %[[WINDOW_START]] : {{.*}} -> !torch.vtensor<[?,?],i1>
+  // CHECK:      %[[MASK_2D:.+]] = torch.aten.logical_and %[[CAUSAL]], %[[IN_WINDOW]] : {{.*}} -> !torch.vtensor<[?,?],i1>
+  // CHECK:      %[[MASK_3D:.+]] = torch.aten.unsqueeze %[[MASK_2D]], %[[MASK_DIM_0]] : {{.*}} -> !torch.vtensor<[1,?,?],i1>
+  // CHECK:      %[[MASK:.+]] = torch.aten.unsqueeze %[[MASK_3D]], %[[MASK_DIM_0]] : {{.*}} -> !torch.vtensor<[1,1,?,?],i1>
+  // Active cache slice [active_start, total_seq)
+  // CHECK:      %[[ACTIVE_K:.+]] = torch.aten.slice.Tensor %[[PRESENT_K]], %[[CACHE_DIM]], %[[ACTIVE_START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ACTIVE_V:.+]] = torch.aten.slice.Tensor %[[PRESENT_V]], %[[CACHE_DIM]], %[[ACTIVE_START]], %[[TOTAL_SEQ]], %[[STEP]] : {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // Attention with the window mask and is_causal=false
+  // CHECK:      %[[ATTN:.+]] = torch.aten.scaled_dot_product_attention %[[Q_PERMUTED]], %[[ACTIVE_K]], %[[ACTIVE_V]], %[[MASK]], %{{.+}}, %[[FALSE]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      return %{{.+}}, %[[PRESENT_K]], %[[PRESENT_V]] : !torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>
+  %res:3 = torch.operator "onnx.GroupQueryAttention"(
+             %query, %key, %value, %past_k, %past_v, %seqlens_k, %total_seq)
+             {torch.onnx.kv_num_heads = 2 : si64, torch.onnx.num_heads = 2 : si64, torch.onnx.local_window_size = 4 : si64}
+             : (!torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,?,16],f32>,
+                !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>,
+                !torch.vtensor<[1],si32>, !torch.vtensor<[1],si32>)
+             -> (!torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>)
+  return %res#0, %res#1, %res#2 : !torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>
+}
+
+// -----
+
+// CHECK-LABEL: @test_group_query_attention_empty_optional_inputs
+// CHECK-SAME:  (%[[QUERY_ARG:.+]]: !torch.vtensor<[?,?,16],f32>, %[[KEY_ARG:.+]]: !torch.vtensor<[?,?,16],f32>, %[[VALUE_ARG:.+]]: !torch.vtensor<[?,?,16],f32>,
+// CHECK-SAME:   %[[PAST_K_ARG:.+]]: !torch.vtensor<[?,2,?,8],f32>, %[[PAST_V_ARG:.+]]: !torch.vtensor<[?,2,?,8],f32>,
+// CHECK-SAME:   %[[COS_ARG:.+]]: !torch.vtensor<[?,?],si64>, %[[SIN_ARG:.+]]: !torch.vtensor<[?,?],si64>)
+// As onnxruntime-genai exports GQA for Gemma3: empty position_ids and
+// attention_bias inputs after sin_cache, and seqlens_k of shape [batch, 1].
+func.func @test_group_query_attention_empty_optional_inputs(
+  %query: !torch.vtensor<[?,?,16],f32>,
+  %key: !torch.vtensor<[?,?,16],f32>,
+  %value: !torch.vtensor<[?,?,16],f32>,
+  %past_k: !torch.vtensor<[?,2,?,8],f32>,
+  %past_v: !torch.vtensor<[?,2,?,8],f32>,
+  %cos_cache: !torch.vtensor<[?,?],si64>,
+  %sin_cache: !torch.vtensor<[?,?],si64>)
+  -> (!torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>)
+  attributes {torch.onnx_meta.ir_version = 10 : si64, torch.onnx_meta.opset_version = 22 : si64, torch.onnx_meta.producer_name = "", torch.onnx_meta.producer_version = ""} {
+  %none_position_ids = torch.constant.none
+  %none_attention_bias = torch.constant.none
+  %seqlens_k = torch.operator "onnx.Constant"() {torch.onnx.value = dense<1> : tensor<1x1xsi32>} : () -> !torch.vtensor<[1,1],si32>
+  %total_seq = torch.operator "onnx.Constant"() {torch.onnx.value = dense<1> : tensor<1xsi32>} : () -> !torch.vtensor<[1],si32>
+  // Rotary embeddings use the cos/sin caches at inputs 7 and 8
+  // CHECK:      %[[Q_ROTARY:.+]] = torch.onnx.rotary_embedding %{{.+}}, %[[POS_IDS:.+]], %[[COS_ARG]], %[[SIN_ARG]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[K_ROTARY:.+]] = torch.onnx.rotary_embedding %{{.+}}, %[[POS_IDS]], %[[COS_ARG]], %[[SIN_ARG]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[PRESENT_K:.+]] = torch.aten.slice_scatter %[[PAST_K_ARG]], %[[K_ROTARY]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[PRESENT_V:.+]] = torch.aten.slice_scatter %[[PAST_V_ARG]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      %[[ATTN:.+]] = torch.aten.scaled_dot_product_attention %[[Q_ROTARY]], {{.*}} -> !torch.vtensor<[?,2,?,8],f32>
+  // CHECK:      return %{{.+}}, %[[PRESENT_K]], %[[PRESENT_V]] : !torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>
+  %res:3 = torch.operator "onnx.GroupQueryAttention"(
+             %query, %key, %value, %past_k, %past_v, %seqlens_k, %total_seq, %cos_cache, %sin_cache,
+             %none_position_ids, %none_attention_bias)
+             {torch.onnx.kv_num_heads = 2 : si64, torch.onnx.num_heads = 2 : si64, torch.onnx.do_rotary = 1 : si64}
+             : (!torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,?,16],f32>,
+                !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>,
+                !torch.vtensor<[1,1],si32>, !torch.vtensor<[1],si32>,
+                !torch.vtensor<[?,?],si64>, !torch.vtensor<[?,?],si64>, !torch.none, !torch.none)
+             -> (!torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>)
+  return %res#0, %res#1, %res#2 : !torch.vtensor<[?,?,16],f32>, !torch.vtensor<[?,2,?,8],f32>, !torch.vtensor<[?,2,?,8],f32>
+}
